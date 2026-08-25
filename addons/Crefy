@@ -30,16 +30,29 @@ local Window = Library:CreateWindow({
 local Tabs = {
     Main = Window:AddTab({ Name = "Main", Icon = "crosshair", Description = "Aimbot & Ragebot" }),
     Character = Window:AddTab({ Name = "Character", Icon = "user", Description = "Character utilities" }),
-    Combat = Window:AddTab({ Name = "Combat", Icon = "sword", Description = "Combat utilities" }),
-    Misc = Window:AddTab({ Name = "Misc", Icon = "settings", Description = "Miscellaneous" }),
+    Misc = Window:AddTab({ Name = "Misc", Icon = "settings", Description = "Weapons & Mods" }),
     ["UI Settings"] = Window:AddTab({ Name = "UI Settings", Icon = "settings", Description = "Configure the menu" }),
 }
+
+-- Main sub-tabs: keep all existing Aimbot/Silent/Flick UI under Aimbot,
+-- and keep Ragebot + its dependencies under Ragebot.
+local MainSubTabs = Tabs.Main
+MainSubTabs:SetSubTabAlignment("Center")
+local AimbotSubTab = MainSubTabs:AddSubTab({ Name = "Aimbot", Icon = "crosshair" })
+local RagebotSubTab = MainSubTabs:AddSubTab({ Name = "Ragebot", Icon = "sword" })
+
+-- Misc sub-tabs: preserve the old Misc tab in Weapons and the old Combat tab in Mods.
+local MiscSubTabs = Tabs.Misc
+MiscSubTabs:SetSubTabAlignment("Center")
+local WeaponsSubTab = MiscSubTabs:AddSubTab({ Name = "Weapons", Icon = "sword" })
+local ModsSubTab = MiscSubTabs:AddSubTab({ Name = "Mods", Icon = "wrench" })
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 local lp = Players.LocalPlayer
 
 local antikatana = false
@@ -1101,7 +1114,7 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
-Ragebot = {}
+Ragebot = { enabled = false }
 do
 local replicatedstorage = cloneref(game:GetService("ReplicatedStorage"))
 local players = cloneref(game:GetService("Players"))
@@ -1264,6 +1277,15 @@ local config = {
         weaponPick = "primary",
         forceWeapon = true,
         rageMasterOn = false,
+        evasion = {
+            mode = "Normal",
+            translocate = {
+                offset = -5,
+                active = false,
+                serverCFrame = nil,
+                hasTarget = false,
+            },
+        },
         meleeFeetDrop = 3.5,
         underOffset = 4,
         attackOffset = 4,
@@ -1394,6 +1416,11 @@ local vhState = {
 
 local localfighter = modules.fighter and modules.fighter.LocalFighter or nil
 local oldpos
+local startsync
+local translocateController
+local startTranslocateSync
+local stopTranslocateSync
+local translocateConnection
 
 local indicator = Drawing.new("Circle")
 indicator.Thickness = 1.5
@@ -2004,30 +2031,42 @@ local function refreshAtk()
 end
 
 local function stopsync()
-    if not config.state.csyncactive then return end
     if config.orbit.connection then
         config.orbit.connection:Disconnect()
         config.orbit.connection = nil
     end
+    if stopTranslocateSync then
+        stopTranslocateSync()
+    end
+
     config.state.csyncactive = false
     config.orbit.active = false
     clrVoidSnap()
     config.voidspam.phase = nil
     config.voidspam.shotIssued = false
+
     if config.orbit.savedpos and localfighter and localfighter.Entity and localfighter.Entity.RootPart and not getgenv().InstanceUndergroundEnabled then
         local ok, pos = pcall(function() return config.orbit.savedpos end)
         if ok and pos then
-            local currentPos = localfighter.Entity.RootPart.CFrame
-            local distance = (currentPos.Position - pos.Position).Magnitude
             pcall(function()
                 localfighter.Entity.RootPart.CFrame = pos
             end)
         end
     end
+
     config.orbit.serverpos = nil
     config.orbit.savedpos = nil
+    oldpos = nil
     config.voidspam.phase = nil
     config.voidspam.shotIssued = false
+
+    local transState = config.target.evasion.translocate
+    transState.active = false
+    transState.hasTarget = false
+    transState.serverCFrame = nil
+    if translocateController then
+        translocateController:Reset()
+    end
     oldpos = nil
 end
 
@@ -2201,7 +2240,318 @@ local stopvoid = function()
     end
 end
 
-local function startsync()
+translocateController = {
+    rootPart = nil,
+    boundId = "crefy_translocate_controller",
+    oldCFrame = nil,
+    serverCFrame = nil,
+    renderBound = false,
+}
+
+function translocateController:SetRootPart(rootPart)
+    if self.rootPart ~= rootPart then
+        self.rootPart = rootPart
+        self.oldCFrame = rootPart and rootPart.CFrame or nil
+        self.serverCFrame = nil
+    elseif self.oldCFrame == nil and rootPart then
+        self.oldCFrame = rootPart.CFrame
+    end
+end
+
+function translocateController:GetClientCFrame()
+    local cf = self.oldCFrame
+    if not cf and self.rootPart then
+        cf = self.rootPart.CFrame
+    end
+    return cf
+end
+
+function translocateController:SetServerCFrame(cf)
+    self.serverCFrame = cf
+end
+
+function translocateController:GetServerCFrame()
+    local cf = self.serverCFrame
+    if not cf and self.rootPart then
+        cf = self.rootPart.CFrame
+    end
+    return cf
+end
+
+function translocateController:HeartbeatUpdate()
+    local root = self.rootPart
+    local serverCF = self.serverCFrame
+    if not root or not serverCF then
+        return
+    end
+
+    self.oldCFrame = root.CFrame
+    pcall(function()
+        root.CFrame = serverCF
+    end)
+end
+
+function translocateController:RenderStepUpdate()
+    local root = self.rootPart
+    local clientCF = self.oldCFrame
+    if not root or not clientCF then
+        return
+    end
+
+    pcall(function()
+        root.CFrame = clientCF
+    end)
+    self.oldCFrame = nil
+end
+
+function translocateController:BindRenderStep()
+    if self.renderBound then
+        return
+    end
+
+    pcall(function()
+        runsvc:UnbindFromRenderStep(self.boundId)
+    end)
+
+    runsvc:BindToRenderStep(
+        self.boundId,
+        Enum.RenderPriority.First.Value,
+        function()
+            self:RenderStepUpdate()
+        end
+    )
+
+    self.renderBound = true
+end
+
+function translocateController:Reset()
+    self.oldCFrame = nil
+    self.serverCFrame = nil
+    self.rootPart = nil
+
+    if self.renderBound then
+        pcall(function()
+            runsvc:UnbindFromRenderStep(self.boundId)
+        end)
+        self.renderBound = false
+    end
+end
+
+-- Bind once at construction. Full mode-stop cleanup may unbind it;
+-- startTranslocateSync() re-binds it only when a new Translocate session begins.
+translocateController:BindRenderStep()
+
+local function translocateApplyForcedCrouch(enabled)
+    -- Kicia explicitly clears forced crouch for Translocate. Crefy does not
+    -- expose the same internal character-controller method, so only call it
+    -- when a compatible implementation is actually present.
+    local entity = localfighter and localfighter.Entity
+    if entity then
+        for _, name in ipairs({ "_ApplyForcedCrouch", "ApplyForcedCrouch", "SetForcedCrouch" }) do
+            local fn = entity[name]
+            if type(fn) == "function" then
+                pcall(fn, entity, enabled == true)
+                return
+            end
+        end
+    end
+end
+
+local function translocateCompute(originCFrame, hasTarget)
+    local state = config.target.evasion.translocate
+    state.hasTarget = hasTarget == true
+
+    if not originCFrame then
+        state.serverCFrame = nil
+        state.active = false
+        return nil
+    end
+
+    local offset = tonumber(state.offset) or -5
+
+    if state.hasTarget then
+        local tagged = CollectionService:GetTagged("OutOfBoundsPart")
+        local anchor = nil
+
+        for _, part in ipairs(tagged) do
+            if part and part:IsA("BasePart") and part:GetAttribute("KillDelay") == 0 then
+                anchor = part
+                break
+            end
+        end
+
+        if anchor then
+            local cf = anchor.CFrame * CFrame.new(
+                0,
+                -anchor.Size.Y / 2 + offset,
+                0
+            )
+            state.serverCFrame = cf
+            state.active = true
+            return cf
+        end
+    end
+
+    local fallback = CFrame.new(
+        originCFrame.Position + Vector3.new(10000, 10000, 1000000000)
+    )
+    state.serverCFrame = fallback
+    state.active = state.hasTarget
+    return fallback
+end
+
+local function clearTranslocateState()
+    -- Lightweight state clear only.
+    -- Do NOT Reset()/Unbind RenderStep here: target/root can disappear
+    -- temporarily, and repeatedly unbinding/rebinding the controller can
+    -- create lifecycle churn. Full controller cleanup belongs to
+    -- stopTranslocateSync().
+    local state = config.target.evasion.translocate
+    state.active = false
+    state.hasTarget = false
+    state.serverCFrame = nil
+    config.orbit.serverpos = nil
+    config.orbit.active = false
+end
+
+local function applyTranslocateStep()
+    local state = config.target.evasion.translocate
+    if config.target.evasion.mode ~= "Translocate" then
+        clearTranslocateState()
+        return false
+    end
+
+    if not localfighter or not localfighter.Entity or not localfighter.Entity.RootPart then
+        clearTranslocateState()
+        return false
+    end
+
+    local rootPart = localfighter.Entity.RootPart
+    translocateController:SetRootPart(rootPart)
+
+    local hasTarget = config.target.character ~= nil and valid(config.target.character)
+    local targetRoot = hasTarget and config.target.character:FindFirstChild("HumanoidRootPart") or nil
+    hasTarget = targetRoot ~= nil
+
+    -- Kicia's calculator intentionally handles both states:
+    --   HasTargets() == true  -> OutOfBoundsPart anchor
+    --   HasTargets() == false -> far fallback position
+    -- Keep that behavior here instead of dropping the update when the target disappears.
+    local clientCFrame = translocateController:GetClientCFrame()
+    if not clientCFrame then
+        clearTranslocateState()
+        return false
+    end
+
+    local computedCFrame = translocateCompute(clientCFrame, hasTarget)
+    if not computedCFrame then
+        return false
+    end
+
+    translocateApplyForcedCrouch(false)
+    translocateController:SetServerCFrame(computedCFrame)
+    translocateController:HeartbeatUpdate()
+
+    config.orbit.serverpos = computedCFrame.Position
+    config.orbit.active = true
+    state.serverCFrame = computedCFrame
+    state.active = hasTarget
+
+    return true
+end
+
+startTranslocateSync = function()
+    if config.target.evasion.mode ~= "Translocate" then return end
+    if not Ragebot.enabled then return end
+    if translocateConnection then return end
+    if config.target.immune then return end
+
+    -- Re-bind the render-step controller after any previous Reset().
+    translocateController:BindRenderStep()
+
+    -- Start immediately even with no target. The connection stays alive and
+    -- waits for a valid target instead of silently returning and requiring
+    -- another manual toggle.
+    config.state.csyncactive = true
+    config.orbit.active = false
+    config.voidspam.phase = nil
+    config.voidspam.shotIssued = false
+
+    if localfighter and localfighter.Entity and localfighter.Entity.RootPart then
+        config.orbit.savedpos = localfighter.Entity.RootPart.CFrame
+    end
+
+    translocateConnection = runsvc.Heartbeat:Connect(function()
+        if config.target.evasion.mode ~= "Translocate" then
+            stopTranslocateSync()
+            return
+        end
+        if not config.state.csyncactive then
+            stopTranslocateSync()
+            return
+        end
+        if config.target.immune then
+            clearTranslocateState()
+            return
+        end
+        if not localfighter or not localfighter.Entity or not localfighter.Entity.RootPart then
+            -- Keep the RenderStep controller bound, but detach the old root
+            -- until the character/root returns. This avoids destroying the
+            -- controller and rebuilding it every frame.
+            translocateController:SetRootPart(nil)
+            return
+        end
+
+        -- Keep the controller alive without a target. The calculator itself
+        -- decides between the anchor path and Kicia's fallback path.
+        applyTranslocateStep()
+    end)
+end
+
+stopTranslocateSync = function()
+    if translocateConnection then
+        translocateConnection:Disconnect()
+        translocateConnection = nil
+    end
+
+    -- Restore the pre-Translocate CFrame when this mode stops on its own
+    -- (for example when the target becomes invalid), then clear every cached
+    -- position so a later mode cannot reuse stale state.
+    if config.orbit.savedpos
+        and localfighter
+        and localfighter.Entity
+        and localfighter.Entity.RootPart
+        and not getgenv().InstanceUndergroundEnabled
+    then
+        pcall(function()
+            localfighter.Entity.RootPart.CFrame = config.orbit.savedpos
+        end)
+    end
+
+    config.state.csyncactive = false
+    config.orbit.active = false
+    config.orbit.serverpos = nil
+    config.orbit.savedpos = nil
+    oldpos = nil
+    translocateApplyForcedCrouch(false)
+
+    local state = config.target.evasion.translocate
+    state.active = false
+    state.hasTarget = false
+    state.serverCFrame = nil
+
+    if translocateController then
+        translocateController:Reset()
+    end
+end
+
+startsync = function()
+    if config.target.evasion.mode == "Translocate" then
+        if not translocateConnection then
+            startTranslocateSync()
+        end
+        return
+    end
     if config.state.csyncactive then return end
     if config.target.immune then return end
     if not config.target.character or not valid(config.target.character) then return end
@@ -2225,6 +2575,7 @@ local function startsync()
         if config.target.immune then stopsync() return end
 
         setOrbR()
+
         oldpos = localfighter.Entity.RootPart.CFrame
 
         local function isQuickSwapActive()
@@ -2323,6 +2674,8 @@ local function startsync()
 end
 
 local function autoshoot()
+    -- Translocate is movement-only; never enter the Normal auto-shoot path.
+    if config.target.evasion.mode == "Translocate" then return end
     if not config.target.enabled or not config.target.character or not valid(config.target.character) or not config.target.autoshoot then return end
     if config.voidspam.enabled and config.voidspam.phase == "hide" then return end
     if config.target.immune then return end
@@ -2394,7 +2747,20 @@ if modules.camcontrol and type(modules.camcontrol.Update) == "function" then
     modules.camcontrol.Update = function(...)
         if getgenv().InstanceUndergroundEnabled then
             return oldcamupdate(...)
-        elseif config.state.csyncactive and localfighter and localfighter.Entity and localfighter.Entity.RootPart and oldpos then
+        end
+
+        -- The Translocate controller owns client/server CFrame separation.
+        -- Do not restore the generic csync oldpos while Translocate is active.
+        if config.target.evasion.mode == "Translocate" then
+            return oldcamupdate(...)
+        end
+
+        if config.state.csyncactive
+            and localfighter
+            and localfighter.Entity
+            and localfighter.Entity.RootPart
+            and oldpos
+        then
             localfighter.Entity.RootPart.CFrame = oldpos
         end
         return oldcamupdate(...)
@@ -2474,7 +2840,9 @@ local function settarget(char)
         config.target.immune = true
         indicator.Color = Color3.fromRGB(180, 0, 255)
     else
-        eqSlot()
+        if config.target.evasion.mode ~= "Translocate" then
+            eqSlot()
+        end
         startsync()
     end
 end
@@ -2654,9 +3022,11 @@ runsvc.Heartbeat:Connect(function()
             cleartarget()
             return
         end
-        eqSlot()
-        if config.target.autoshoot and not config.target.immune then
-            autoshoot()
+        if config.target.evasion.mode ~= "Translocate" then
+            eqSlot()
+            if config.target.autoshoot and not config.target.immune then
+                autoshoot()
+            end
         end
     end
 end)
@@ -2674,6 +3044,9 @@ Ragebot.valid = valid
 Ragebot.player = player
 Ragebot.eqSlot = eqSlot
 Ragebot.refreshAtk = refreshAtk
+Ragebot.applyTranslocateStep = applyTranslocateStep
+Ragebot.startTranslocateSync = startTranslocateSync
+Ragebot.stopTranslocateSync = stopTranslocateSync
 
 do
 local config = Ragebot.config
@@ -2762,6 +3135,9 @@ local function inVoid()
 end
 
 local function isKilling()
+    if config.target.evasion.mode == "Translocate" then
+        return false
+    end
     if not rageActive() then
         return false
     end
@@ -2931,7 +3307,7 @@ end
 end
 end
 
-local LeftGroupBox = Tabs.Main:AddLeftGroupbox("Aimbot", "crosshair")
+local LeftGroupBox = AimbotSubTab:AddLeftGroupbox("Aimbot", "crosshair")
 
 LeftGroupBox:AddToggle("AimbotEnabled", {
     Text = "Enable Aimbot",
@@ -2993,7 +3369,7 @@ LeftGroupBox:AddDropdown("AimbotRunService", {
     Callback = function(v) setRunService(v) end
 })
 
-local FlickGroupBox = Tabs.Main:AddRightGroupbox("Flick Bot", "crosshair")
+local FlickGroupBox = AimbotSubTab:AddRightGroupbox("Flick Bot", "crosshair")
 FlickGroupBox:AddToggle("FlickEnabled", {
     Text = "Enable Flick",
     Default = false,
@@ -3064,7 +3440,7 @@ FlickGroupBox:AddDropdown("FlickFireMode", {
     end
 })
 
-local SilentGroupBox = Tabs.Main:AddLeftGroupbox("Silent Aim", "target")
+local SilentGroupBox = AimbotSubTab:AddLeftGroupbox("Silent Aim", "target")
 SilentGroupBox:AddToggle("SilentAimEnabled", {
     Text = "Enable Silent Aim",
     Default = false,
@@ -3177,7 +3553,7 @@ CharacterGroupBox:AddInput("UndergroundCustomDepth", {
     end
 })
 
-local WeaponGroup = Tabs.Misc:AddLeftGroupbox("Weapon Mods", "sword")
+local WeaponGroup = WeaponsSubTab:AddLeftGroupbox("Weapon Mods", "sword")
 WeaponGroup:AddButton({
     Text = "No Melee Animation",
     Func = function()
@@ -3267,7 +3643,7 @@ WeaponGroup:AddButton({
     end
 })
 
-local DeviceGroup = Tabs.Misc:AddRightGroupbox("Device Spoof", "smartphone")
+local DeviceGroup = WeaponsSubTab:AddRightGroupbox("Device Spoof", "smartphone")
 DeviceGroup:AddToggle("DeviceSpoof", {
     Text = "Enable Device Spoof",
     Default = false,
@@ -3286,7 +3662,7 @@ DeviceGroup:AddDropdown("DeviceType", {
     end
 })
 
-local RageGroupBox = Tabs.Main:AddRightGroupbox("Ragebot", "sword")
+local RageGroupBox = RagebotSubTab:AddRightGroupbox("Ragebot", "sword")
 
 RageGroupBox:AddToggle("RagebotEnabled", {
     Text = "Enable",
@@ -3296,6 +3672,15 @@ RageGroupBox:AddToggle("RagebotEnabled", {
         Ragebot.config.target.rageMasterOn = v
         Ragebot.config.target.auto = v
         Ragebot.config.target.autoshoot = v
+        if not v then
+            Ragebot.config.target.evasion.mode = "Normal"
+            if stopsync then stopsync() end
+            if Ragebot.stopvoid then Ragebot.stopvoid() end
+        elseif Ragebot.config.target.evasion.mode == "Translocate" then
+            if Ragebot.startTranslocateSync then
+                Ragebot.startTranslocateSync()
+            end
+        end
     end
 }):AddKeyPicker("RagebotKey", {
     Text = "Ragebot",
@@ -3319,7 +3704,84 @@ RageGroupBox:AddToggle("RagebotEnabled", {
     end
 })
 
-RageGroupBox:AddToggle("RagebotAutoTarget", {
+local RageNormalGate = { Type = "Toggle", Value = true }
+local RageTranslocateGate = { Type = "Toggle", Value = false }
+
+local RageNormalDep
+local RageTranslocateDep
+
+RageGroupBox:AddDropdown("RagebotMode", {
+    Text = "Mode",
+    Default = Ragebot.config.target.evasion.mode == "Translocate" and "Translocate" or "Normal",
+    Values = { "Normal", "Translocate" },
+    Callback = function(v)
+        v = tostring(v or "Normal")
+
+        if v == "Translocate" then
+            -- Always stop the previous Normal/Translocate loop before
+            -- starting the new mode. This prevents two Heartbeat handlers
+            -- from writing RootPart.CFrame at the same time.
+            if stopsync then stopsync() end
+            Ragebot.config.target.evasion.mode = "Translocate"
+            RageNormalGate.Value = false
+            RageTranslocateGate.Value = true
+        else
+            Ragebot.config.target.evasion.mode = "Normal"
+            RageNormalGate.Value = true
+            RageTranslocateGate.Value = false
+            if stopsync then stopsync() end
+            if Ragebot.config.target.evasion.translocate then
+                Ragebot.config.target.evasion.translocate.active = false
+                Ragebot.config.target.evasion.translocate.hasTarget = false
+                Ragebot.config.target.evasion.translocate.serverCFrame = nil
+            end
+        end
+
+        RageNormalDep:Update()
+        RageTranslocateDep:Update()
+
+        -- Do not leave the old orbit/void state running when changing evasion mode.
+        if Ragebot.stopvoid then
+            Ragebot.stopvoid()
+        end
+
+        if Ragebot.config.target.evasion.mode == "Translocate" then
+            if Ragebot.startTranslocateSync then
+                Ragebot.startTranslocateSync()
+            end
+        elseif Ragebot.refreshAtk then
+            Ragebot.refreshAtk()
+        end
+    end
+})
+
+RageNormalDep = RageGroupBox:AddDependencyBox()
+
+RageTranslocateDep = RageGroupBox:AddDependencyBox()
+
+RageTranslocateDep:AddSlider("RagebotTranslocateOffset", {
+    Text = "Translocate Offset",
+    Default = Ragebot.config.target.evasion.translocate.offset or -5,
+    Min = -5,
+    Max = 5,
+    Rounding = 1,
+    Compact = true,
+    Callback = function(v)
+        Ragebot.config.target.evasion.translocate.offset = tonumber(v) or -5
+        if Ragebot.config.target.evasion.mode == "Translocate"
+            and Ragebot.startTranslocateSync then
+            Ragebot.startTranslocateSync()
+        end
+    end
+})
+
+RageTranslocateGate.Value = Ragebot.config.target.evasion.mode == "Translocate"
+RageTranslocateDep:SetupDependencies({
+    { RageTranslocateGate, true }
+})
+RageTranslocateDep:Update()
+
+RageNormalDep:AddToggle("RagebotAutoTarget", {
     Text = "Auto Target",
     Default = false,
     Callback = function(v)
@@ -3328,9 +3790,9 @@ RageGroupBox:AddToggle("RagebotAutoTarget", {
 })
 
 local RageUnderGate = { Type = "Toggle", Value = false }
-local RageUnderDep = RageGroupBox:AddDependencyBox()
+local RageUnderDep = RageNormalDep:AddDependencyBox()
 
-RageGroupBox:AddDropdown("RagebotAttackPosition", {
+RageNormalDep:AddDropdown("RagebotAttackPosition", {
     Text = "Attack Position",
     Default = "default",
     Values = {"default", "under"},
@@ -3368,7 +3830,7 @@ RageUnderDep:SetupDependencies({
 RageUnderGate.Value = Ragebot.config.target.attackPosition == "under"
 RageUnderDep:Update()
 
-RageGroupBox:AddSlider("RagebotAttackOffset", {
+RageNormalDep:AddSlider("RagebotAttackOffset", {
     Text = "Attack Offset",
     Default = 4,
     Min = 1,
@@ -3383,7 +3845,7 @@ RageGroupBox:AddSlider("RagebotAttackOffset", {
     end
 })
 
-RageGroupBox:AddDropdown("RagebotWeapon", {
+RageNormalDep:AddDropdown("RagebotWeapon", {
     Text = "Weapon",
     Values = {"primary", "secondary", "melee"},
     Default = Ragebot.config.target.weaponPick or "primary",
@@ -3392,13 +3854,13 @@ RageGroupBox:AddDropdown("RagebotWeapon", {
         if Ragebot.config.state.csyncactive and Ragebot.refreshAtk then
             Ragebot.refreshAtk()
         end
-        if Ragebot.eqSlot then
+        if Ragebot.config.target.evasion.mode ~= "Translocate" and Ragebot.eqSlot then
             Ragebot.eqSlot()
         end
     end
 })
 
-RageGroupBox:AddSlider("RagebotShootAttempts", {
+RageNormalDep:AddSlider("RagebotShootAttempts", {
     Text = "Shoot Attempts",
     Default = Ragebot.config.target.shootAttempts or 1,
     Min = 1,
@@ -3411,7 +3873,7 @@ RageGroupBox:AddSlider("RagebotShootAttempts", {
     end
 })
 
-RageGroupBox:AddDropdown("RagebotHitPart", {
+RageNormalDep:AddDropdown("RagebotHitPart", {
     Text = "Hit Part",
     Default = Ragebot.config.target.hitpart or "Head",
     Values = {"Head", "HumanoidRootPart", "Torso", "UpperTorso", "Closest", "Random"},
@@ -3420,7 +3882,7 @@ RageGroupBox:AddDropdown("RagebotHitPart", {
     end
 })
 
-RageGroupBox:AddToggle("RagebotPrediction", {
+RageNormalDep:AddToggle("RagebotPrediction", {
     Text = "Prediction",
     Default = Ragebot.config.prediction.enabled or false,
     Callback = function(v)
@@ -3428,7 +3890,7 @@ RageGroupBox:AddToggle("RagebotPrediction", {
     end
 })
 
-RageGroupBox:AddSlider("RagebotPredictionMult", {
+RageNormalDep:AddSlider("RagebotPredictionMult", {
     Text = "Prediction Mult",
     Default = Ragebot.config.prediction.multiplier or 1.2,
     Min = 0.1,
@@ -3439,7 +3901,7 @@ RageGroupBox:AddSlider("RagebotPredictionMult", {
     end
 })
 
-RageGroupBox:AddToggle("RagebotVoidSpam", {
+RageNormalDep:AddToggle("RagebotVoidSpam", {
     Text = "Voidspam",
     Default = Ragebot.config.voidspam.enabled or false,
     Callback = function(v)
@@ -3453,7 +3915,7 @@ RageGroupBox:AddToggle("RagebotVoidSpam", {
     end
 })
 
-RageGroupBox:AddSlider("RagebotAttack", {
+RageNormalDep:AddSlider("RagebotAttack", {
     Text = "Attack",
     Default = Ragebot.config.voidspam.shoot_min or 1,
     Min = 0,
@@ -3467,7 +3929,7 @@ RageGroupBox:AddSlider("RagebotAttack", {
     end
 })
 
-RageGroupBox:AddSlider("RagebotHide", {
+RageNormalDep:AddSlider("RagebotHide", {
     Text = "Hide",
     Default = Ragebot.config.voidspam.hide_min or 1,
     Min = 0,
@@ -3481,7 +3943,7 @@ RageGroupBox:AddSlider("RagebotHide", {
     end
 })
 
-RageGroupBox:AddSlider("RagebotReloadDelay", {
+RageNormalDep:AddSlider("RagebotReloadDelay", {
     Text = "Reload -> Attack Delay",
     Default = Ragebot.config.state.reloadDelay or 0.5,
     Min = 0.01,
@@ -3494,8 +3956,224 @@ RageGroupBox:AddSlider("RagebotReloadDelay", {
     end
 })
 
+RageNormalGate.Value = Ragebot.config.target.evasion.mode ~= "Translocate"
+RageNormalDep:SetupDependencies({
+    { RageNormalGate, true }
+})
+RageNormalDep:Update()
 
-local ModsGroupBox = Tabs.Combat:AddLeftGroupbox("Gun Mods", "gun")
+
+
+-- Combat exploits
+local Exploits = (function()
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local LocalPlayer = Players.LocalPlayer
+
+    local Exploits = {}
+    Exploits.__index = Exploits
+
+    function Exploits.new(clientFighter, clientItem)
+        local self = setmetatable({}, Exploits)
+        self.clientFighter = clientFighter
+        self.clientItem = clientItem
+        self.lastShot = 0
+
+        local function getEquippedItem(character)
+            return character and character:FindFirstChild("EquippedItem")
+        end
+
+        local function getCurrentItem()
+            local item = getEquippedItem(LocalPlayer.Character)
+            if item then
+                self.clientItem = item
+                return item
+            end
+            return self.clientItem
+        end
+
+        local function fullAuto()
+            if not Toggles.exploits_full_auto or not Toggles.exploits_full_auto.Value then
+                return
+            end
+
+            local item = getCurrentItem()
+            if not item then return end
+
+            local info = item:FindFirstChild("Info") or item.Info
+            if not info then return end
+
+            local itemType
+            pcall(function() itemType = info.Type end)
+            if itemType ~= "Gun" then return end
+
+            local rate = Options.exploits_firerate and Options.exploits_firerate.Value or 600
+            rate = math.max(1, tonumber(rate) or 600)
+
+            local now = tick()
+            local interval = 60 / rate
+            if now - self.lastShot < interval then return end
+            self.lastShot = now
+
+            pcall(function()
+                local camera = workspace.CurrentCamera
+                if not camera then return end
+
+                local direction = camera.CFrame.Position + camera.CFrame.LookVector * 100
+
+                if self.clientItem and type(self.clientItem.StartShooting) == "function" then
+                    self.clientItem:StartShooting(direction)
+                elseif type(item.StartShooting) == "function" then
+                    item:StartShooting(direction)
+                end
+            end)
+        end
+
+        function self:removeSpread(payload)
+            if not Toggles.exploits_no_spread or not Toggles.exploits_no_spread.Value then
+                return payload
+            end
+
+            if type(payload) == "table" then
+                payload.spread = 0
+                payload.randomSpread = 0
+            end
+
+            return payload
+        end
+
+        function self:forceBackstab(character)
+            if not Toggles.exploits_always_backstab
+                or not Toggles.exploits_always_backstab.Value then
+                return false
+            end
+
+            local item = getCurrentItem()
+            if not item then return false end
+
+            local info = item:FindFirstChild("Info") or item.Info
+            if not info then return false end
+
+            local itemType
+            pcall(function() itemType = info.Type end)
+            if itemType ~= "Melee" or not character then return false end
+
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if not root then return false end
+
+            return pcall(function()
+                if type(item.HeavyAttack) == "function" then
+                    item:HeavyAttack(root.Position)
+                end
+            end)
+        end
+
+        local function autoRespawn()
+            if not Toggles.arcade_auto_respawn or not Toggles.arcade_auto_respawn.Value then
+                return
+            end
+
+            local character = LocalPlayer.Character
+            local hum = character and character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health <= 0 then
+                task.wait(1)
+                pcall(function() LocalPlayer:LoadCharacter() end)
+            end
+        end
+
+        local function autoAmmo()
+            if not Toggles.arcade_auto_ammo or not Toggles.arcade_auto_ammo.Value then
+                return
+            end
+
+            local item = getCurrentItem()
+            if not item then return end
+
+            local data = item:FindFirstChild("Data") or item.Data
+            if not data then return end
+
+            local ammo, reserve
+            pcall(function()
+                ammo = data.Ammo
+                reserve = data.AmmoReserve
+            end)
+
+            if ammo == 0 and tonumber(reserve) and reserve > 0 then
+                pcall(function()
+                    if type(item.StartReloading) == "function" then
+                        item:StartReloading()
+                    end
+                end)
+            end
+        end
+
+        function self:grenadeSettings(character)
+            local settings = Options.exploits_grenade_settings
+                and Options.exploits_grenade_settings.Value or {}
+
+            local item = getEquippedItem(character)
+            if not item then return end
+
+            local info = item:FindFirstChild("Info") or item.Info
+            if not info then return end
+
+            local itemType
+            pcall(function() itemType = info.Type end)
+            if itemType ~= "Grenade" then return end
+
+            if settings["cook on throw"] then
+                pcall(function()
+                    if type(item.StartCooking) == "function" then
+                        item:StartCooking()
+                    end
+                end)
+            end
+
+            if settings["always backstab"] then
+                pcall(function()
+                    if type(item.ThrowBackstab) == "function" then
+                        item:ThrowBackstab()
+                    end
+                end)
+            end
+        end
+
+        self.connections = {
+            RunService.Heartbeat:Connect(fullAuto),
+            RunService.Heartbeat:Connect(autoRespawn),
+            RunService.Heartbeat:Connect(autoAmmo),
+            RunService.Heartbeat:Connect(function()
+                self:grenadeSettings(LocalPlayer.Character)
+            end),
+        }
+
+        return self
+    end
+
+    function Exploits:Destroy()
+        if self.connections then
+            for _, connection in ipairs(self.connections) do
+                pcall(function() connection:Disconnect() end)
+            end
+            self.connections = nil
+        end
+    end
+
+    return Exploits
+end)()
+
+local _exploitsFighter
+local _exploitsItem
+
+pcall(function()
+    local fighterController = getFighterController and getFighterController()
+    _exploitsFighter = fighterController and fighterController.LocalFighter
+    _exploitsItem = _exploitsFighter and _exploitsFighter.EquippedItem
+end)
+
+local CombatExploits = Exploits.new(_exploitsFighter, _exploitsItem)
+
+local ModsGroupBox = ModsSubTab:AddLeftGroupbox("Gun Mods", "gun")
 ModsGroupBox:AddToggle("NoCooldown", {
     Text = "Rapid Fire",
     Default = false,
@@ -3539,10 +4217,64 @@ ModsGroupBox:AddToggle("RapidAttack", {
 ModsGroupBox:AddToggle("NoMuzzleFlash", {
     Text = "No Muzzle Flash",
     Default = false,
-    Callback = function(v) end
+    Callback = function(v)
+        ModSettings.NoSmoke = v
+        if v then applyNoSmoke() end
+    end
 })
 
-local MiscGroupBox = Tabs.Combat:AddLeftGroupbox("Misc Combat", "settings")
+local ExploitsGroupBox = ModsSubTab:AddRightGroupbox("Exploits", "zap")
+ExploitsGroupBox:AddToggle("exploits_full_auto", {
+    Text = "Full Auto",
+    Default = false,
+})
+ExploitsGroupBox:AddSlider("exploits_firerate", {
+    Text = "Fire Rate",
+    Default = 600,
+    Min = 60,
+    Max = 1200,
+    Rounding = 0,
+    Suffix = " RPM",
+})
+ExploitsGroupBox:AddToggle("exploits_no_spread", {
+    Text = "No Spread (Exploit)",
+    Default = false,
+})
+ExploitsGroupBox:AddToggle("exploits_always_backstab", {
+    Text = "Always Backstab",
+    Default = false,
+})
+
+local ArcadeGroupBox = ModsSubTab:AddRightGroupbox("Arcade", "refresh-cw")
+ArcadeGroupBox:AddToggle("arcade_auto_respawn", {
+    Text = "Auto Respawn",
+    Default = false,
+})
+ArcadeGroupBox:AddToggle("arcade_auto_ammo", {
+    Text = "Auto Ammo",
+    Default = false,
+})
+
+local GrenadeGroupBox = ModsSubTab:AddLeftGroupbox("Grenades", "bomb")
+GrenadeGroupBox:AddDropdown("exploits_grenade_settings", {
+    Text = "Grenade Settings",
+    Values = {
+        "Cook on Throw",
+        "Always Backstab",
+    },
+    Multi = true,
+    Default = {},
+    Callback = function(value)
+        local normalized = {}
+        if type(value) == "table" then
+            normalized["cook on throw"] = value["Cook on Throw"] == true
+            normalized["always backstab"] = value["Always Backstab"] == true
+        end
+        Options.exploits_grenade_settings.Value = normalized
+    end,
+})
+
+local MiscGroupBox = ModsSubTab:AddLeftGroupbox("Misc Combat", "settings")
 MiscGroupBox:AddToggle("AntiKatana", {
     Text = "Anti Katana",
     Default = false,
