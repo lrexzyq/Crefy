@@ -14798,6 +14798,7 @@ ErrorReporter.set_game(GameName)
                 return true
             end
             end
+            do
             local CollectBestAimbotTarget = function(requireVisible, ignoreFovOverride)
                 EnsureAimbotTargetTracking()
                 local aimPart = Options.P2S1D2 and Options.P2S1D2.Value or 'Auto'
@@ -16217,6 +16218,7 @@ ErrorReporter.set_game(GameName)
                 NativeOnlyUseFavoritesConnection = nil,
                 NativeSaveToken = 0,
             }
+            end
             do
             local TWO_PI = math.pi * 2
             local function isRivalsFlightActive()
@@ -25091,6 +25093,7 @@ ErrorReporter.set_game(GameName)
                         Compact = true,
                     })
                     Translocate:SetupDependencies({ { Options.P8S4D2, "Translocate" } })
+                end
                 do
                     local Mods = Tabs.Main:AddLeftGroupbox("Weapon Mods", "swords")
                     Mods:AddToggle("P4S1T1", {
@@ -26616,7 +26619,6 @@ RivalsCosmeticsState.CosmeticsUiLoaded = true
                 end))
 
                 end
-            end
             local MenuGroup = Tabs.Settings:AddLeftGroupbox('Menu', 'wrench')
 MenuGroup:AddToggle('KeybindMenuOpen', {
     Default = Library.KeybindFrame.Visible,
@@ -26918,7 +26920,6 @@ local RivalsRuntime = {}
                 end
                 return true
             end)()
-            end
     else
         if Library and type(Library.Notify) == 'function' then
             Library:Notify({ Title = 'KiciaHook', Description = 'This script only supports RIVALS.', Time = 5 })
