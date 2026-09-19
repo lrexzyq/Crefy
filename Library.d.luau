@@ -325,6 +325,44 @@ export type ImageInfo = {
     Visible: boolean?,
 }
 
+export type DiscordButtonInfo = {
+    Text: string?,
+    Icon: string?,
+    --// true copies the card's Link; a string copies itself
+    Copy: (boolean | string)?,
+    Func: ((Payload: string?) -> ())?,
+    Style: ("Primary" | "Secondary")?,
+    Tooltip: string?,
+    CopiedText: string?,
+    CopyFailedText: string?,
+}
+
+export type DiscordBoxInfo = {
+    --// Images take an asset id, an rbxassetid://, a custom-asset url, or a lucide name
+    Banner: string?,
+    BannerColor: (Color3 | string)?,
+    Avatar: string?,
+    AvatarColor: (Color3 | string)?,
+
+    Title: string?,
+    Subtitle: string?,
+    Status: ("online" | "idle" | "away" | "dnd" | "busy" | "streaming" | "offline" | "invisible" | string)?,
+    StatusColor: Color3?,
+
+    Accent: (Color3 | string)?,
+    Link: string?,
+    Buttons: { DiscordButtonInfo }?,
+
+    CopyText: string?,
+    CopyIcon: string?,
+    CopiedText: string?,
+    CopyFailedText: string?,
+
+    BannerHeight: number?,
+    AvatarSize: number?,
+    Visible: boolean?,
+}
+
 export type PlayerInfoOptions = {
     Player: (Player | string)?,
     UserId: number?,
@@ -717,6 +755,41 @@ export type PlayerInfo = {
     Destroy: (self: PlayerInfo) -> (),
 }
 
+export type DiscordBox = {
+    GetTotalHeight: (self: DiscordBox) -> number,
+
+    Banner: string?,
+    BannerColor: (Color3 | string)?,
+    Avatar: string?,
+    AvatarColor: (Color3 | string)?,
+    Title: string,
+    Subtitle: string,
+    Status: string?,
+    StatusColor: Color3?,
+    Accent: (Color3 | string)?,
+    Link: string?,
+    Buttons: { DiscordButtonInfo },
+    BannerHeight: number,
+    AvatarSize: number,
+    Visible: boolean,
+    Type: "DiscordBox",
+    Holder: Frame,
+
+    SetTitle: (self: DiscordBox, Title: string?) -> (),
+    SetSubtitle: (self: DiscordBox, Subtitle: string?) -> (),
+    SetBanner: (self: DiscordBox, Banner: string?, Color: (Color3 | string)?) -> (),
+    SetAvatar: (self: DiscordBox, Avatar: string?, Color: (Color3 | string)?) -> (),
+    SetStatus: (self: DiscordBox, Status: string?, Color: Color3?) -> (),
+    SetAccent: (self: DiscordBox, Accent: (Color3 | string)?) -> (),
+    SetLink: (self: DiscordBox, Link: string?) -> (),
+    SetButtons: (self: DiscordBox, Buttons: { DiscordButtonInfo }?) -> (),
+    SetButtonText: (self: DiscordBox, Index: number, Text: string) -> (),
+    SetBannerHeight: (self: DiscordBox, Height: number) -> (),
+    SetAvatarSize: (self: DiscordBox, Size: number) -> (),
+    SetVisible: (self: DiscordBox, Visible: boolean) -> (),
+    Destroy: (self: DiscordBox) -> (),
+}
+
 export type Video = {
     Video: string,
     Looped: boolean,
@@ -769,6 +842,7 @@ export type Element =
     | Viewport
     | Image
     | PlayerInfo
+    | DiscordBox
     | Video
     | UIPassthrough
     | Divider
@@ -781,6 +855,7 @@ export type Option =
     | Viewport
     | Image
     | PlayerInfo
+    | DiscordBox
     | Video
     | UIPassthrough
     | KeyPicker
@@ -805,6 +880,7 @@ export type BaseGroupbox = {
     AddViewport: (self: Groupbox, Idx: string, Info: ViewportInfo) -> Viewport,
     AddImage: (self: Groupbox, Idx: string, Info: ImageInfo) -> Image,
     AddPlayerInfo: (self: Groupbox, Idx: string, Info: PlayerInfoOptions) -> PlayerInfo,
+    AddDiscordBox: (self: Groupbox, Idx: string, Info: DiscordBoxInfo) -> DiscordBox,
     AddVideo: (self: Groupbox, Idx: string, Info: VideoInfo) -> Video,
     AddUIPassthrough: (self: Groupbox, Idx: string, Info: UIPassthroughInfo) -> UIPassthrough,
     AddDependencyBox: (self: Groupbox) -> DependencyBox,
@@ -1231,6 +1307,7 @@ export type Library = {
         ToggleWindow: boolean,
         TabSwitch: boolean,
         Groupbox: boolean,
+        GroupboxCollapse: boolean,
         Dropdown: boolean,
         KeyPicker: boolean,
     },
@@ -1467,6 +1544,7 @@ export type Library = {
                 ToggleWindow: boolean?,
                 TabSwitch: boolean?,
                 Groupbox: boolean?,
+                GroupboxCollapse: boolean?,
                 Dropdown: boolean?,
                 KeyPicker: boolean?,
             }?,

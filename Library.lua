@@ -260,6 +260,8 @@ local Library = {
         ToggleWindow = false,
         TabSwitch = false,
         Groupbox = false,
+        --// The collapse/expand slide; on by default, it is a small ornament
+        GroupboxCollapse = true,
         Dropdown = false,
         KeyPicker = false
     },
@@ -350,6 +352,34 @@ else
     Library.IsMobile = (Library.DevicePlatform == Enum.Platform.Android or Library.DevicePlatform == Enum.Platform.IOS)
     Library.OriginalMinSize = Library.IsMobile and Vector2.new(480, 240) or Vector2.new(480, 360)
 end
+
+--// Discord card metrics. Only layout defaults live here - every image, colour,
+--// label and action on the card is caller-supplied.
+local DISCORD_BANNER_HEIGHT = 64
+local DISCORD_AVATAR_SIZE = 56
+local DISCORD_AVATAR_RING = 3
+local DISCORD_CARD_PADDING = 10
+local DISCORD_TITLE_HEIGHT = 18
+local DISCORD_SUBTITLE_HEIGHT = 16
+local DISCORD_BUTTON_HEIGHT = 26
+local DISCORD_BUTTON_GAP = 6
+local DISCORD_STATUS_SIZE = 16
+--// How much of the avatar hangs below the banner, as a fraction of its size
+local DISCORD_AVATAR_OVERHANG = 0.45
+local DISCORD_COPY_FEEDBACK_TIME = 1.5
+
+--// Named presets for the status dot; any of them can be overridden per card
+--// with StatusColor, and an unknown name simply hides the dot.
+local DISCORD_STATUS_COLORS = {
+    online = Color3.fromRGB(35, 165, 90),
+    idle = Color3.fromRGB(240, 178, 50),
+    away = Color3.fromRGB(240, 178, 50),
+    dnd = Color3.fromRGB(242, 63, 67),
+    busy = Color3.fromRGB(242, 63, 67),
+    streaming = Color3.fromRGB(89, 54, 149),
+    offline = Color3.fromRGB(128, 132, 142),
+    invisible = Color3.fromRGB(128, 132, 142),
+}
 
 local Templates = {
     --// UI \\--
@@ -471,6 +501,8 @@ local Templates = {
             ToggleWindow = false,
             TabSwitch = false,
             Groupbox = false,
+            --// The collapse/expand slide; on by default, it is a small ornament
+            GroupboxCollapse = true,
             Dropdown = false,
             KeyPicker = false,
             --// The sub tab bar slide; on by default, it is a small ornament
@@ -633,6 +665,32 @@ local Templates = {
         RectSize = Vector2.zero,
         ScaleType = Enum.ScaleType.Fit,
         Height = 200,
+        Visible = true,
+    },
+    DiscordBox = {
+        --// Images: asset id, rbxassetid://, a custom-asset url, or a lucide name
+        Banner = nil,
+        BannerColor = nil,          --// Color3 or scheme name; defaults to Accent
+        Avatar = nil,
+        AvatarColor = nil,
+
+        Title = "",
+        Subtitle = "",
+        Status = nil,               --// online / idle / dnd / streaming / offline
+        StatusColor = nil,          --// Color3 override for the dot
+
+        Accent = nil,               --// Color3 or scheme name; defaults to Blue
+        Link = nil,                 --// payload for buttons with Copy = true
+        Buttons = nil,              --// { { Text, Icon, Copy, Func, Style, Tooltip } }
+
+        --// Fallback button when a Link is given but no Buttons are
+        CopyText = "Copy Link",
+        CopyIcon = "copy",
+        CopiedText = "Copied!",
+        CopyFailedText = "Unsupported",
+
+        BannerHeight = DISCORD_BANNER_HEIGHT,
+        AvatarSize = DISCORD_AVATAR_SIZE,
         Visible = true,
     },
     PlayerInfo = {
@@ -2428,6 +2486,10 @@ local SUBTAB_SLIDE_TWEEN = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.Easi
 --// Fraction of the chip the underline spans, and its gap above the chip's bottom edge
 local SUBTAB_UNDERLINE_WIDTH = 0.66
 local SUBTAB_UNDERLINE_GAP = 3
+--// Same idea for a tabbox's tab strip: the underline spans this fraction of the
+--// button rather than the whole flex cell, so it reads as a marker not a border
+local TABBOX_UNDERLINE_WIDTH = 0.55
+local TABBOX_UNDERLINE_MIN = 16
 --// Transparency per shadow layer, nearest the chip first
 local SUBTAB_SHADOW_TRANSPARENCY = { 0.55, 0.75 }
 --// Hover squashes the chip slightly; the button itself keeps its size so the row
@@ -6740,6 +6802,32 @@ end
 
 local PLAYER_CARD_NO_INSET = { X = 0, Width = 0 }
 local PLAYER_CARD_BANNER_INSET = { X = 2, Width = -5 }
+
+
+
+--// Colour a property that may be either a scheme name (re-themes itself) or a
+--// literal Color3 (pinned). Keeps Library.Registry in step either way.
+local function SetSchemeProperty(Object: Instance, Property: string, Value: (string | Color3)?)
+    local Registry = Library.Registry[Object]
+
+    if typeof(Value) == "Color3" then
+        if Registry then
+            Registry[Property] = nil
+        end
+
+        Object[Property] = Value
+        return
+    end
+
+    local SchemeName = typeof(Value) == "string" and Value or "BlueColor"
+    Object[Property] = Library.Scheme[SchemeName] or Library.Scheme.BlueColor
+
+    if Registry then
+        Registry[Property] = SchemeName
+    else
+        Library.Registry[Object] = { [Property] = SchemeName }
+    end
+end
 
 local BaseGroupbox = {}
 do
@@ -12399,6 +12487,586 @@ do
         return PlayerInfo
     end
 
+    --// Discord-style promo card: a banner strip, a circular avatar overlapping its
+    --// bottom edge with a cut-out ring, a name block, and a row of action buttons
+    --// (copy an invite, run a callback). Nothing here is tied to a particular server
+    --// or profile - every image, colour, label and action is passed in.
+    function Funcs:AddDiscordBox(Idx, Info)
+        if self.Destroyed then return nil end
+
+        Info = Library:Validate(Info, Templates.DiscordBox)
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+
+        local Discord = {
+            Connections = {},
+            Destroyed = false,
+
+            Banner = Info.Banner,
+            BannerColor = Info.BannerColor,
+            Avatar = Info.Avatar,
+            AvatarColor = Info.AvatarColor,
+
+            Title = Info.Title,
+            Subtitle = Info.Subtitle,
+            Status = Info.Status,
+            StatusColor = Info.StatusColor,
+
+            Accent = Info.Accent,
+            Link = Info.Link,
+            Buttons = {},
+
+            BannerHeight = Info.BannerHeight,
+            AvatarSize = Info.AvatarSize,
+
+            Visible = Info.Visible,
+            Text = Info.Title,
+            Type = "DiscordBox",
+        }
+
+        local ButtonObjects = {}
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, Discord.BannerHeight),
+            Visible = Discord.Visible,
+            Parent = Container,
+        })
+
+        --// The card clips, so the banner picks up the card corner radius at the top
+        local Card = New("Frame", {
+            BackgroundColor3 = "MainColor",
+            ClipsDescendants = true,
+            Size = UDim2.fromScale(1, 1),
+            Parent = Holder,
+        })
+        table.insert(Library.Corners, New("UICorner", {
+            CornerRadius = UDim.new(0, Library.CornerRadius),
+            Parent = Card,
+        }))
+        Library:AddOutline(Card)
+
+        local Banner = New("ImageLabel", {
+            BackgroundColor3 = "BlueColor",
+            BorderSizePixel = 0,
+            Image = "",
+            ScaleType = Enum.ScaleType.Crop,
+            Size = UDim2.new(1, 0, 0, Discord.BannerHeight),
+            Parent = Card,
+        })
+
+        --// Ring: a disc in the card colour behind the avatar, which is what makes
+        --// the avatar read as punched out of the banner
+        local AvatarRing = New("Frame", {
+            BackgroundColor3 = "MainColor",
+            BorderSizePixel = 0,
+            Size = UDim2.fromOffset(
+                Discord.AvatarSize + DISCORD_AVATAR_RING * 2,
+                Discord.AvatarSize + DISCORD_AVATAR_RING * 2
+            ),
+            ZIndex = 3,
+            Parent = Card,
+        })
+        New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = AvatarRing })
+
+        local Avatar = New("ImageLabel", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = "BackgroundColor",
+            Image = "",
+            Position = UDim2.fromScale(0.5, 0.5),
+            ScaleType = Enum.ScaleType.Crop,
+            Size = UDim2.fromOffset(Discord.AvatarSize, Discord.AvatarSize),
+            ZIndex = 4,
+            Parent = AvatarRing,
+        })
+        New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = Avatar })
+
+        local StatusRing = New("Frame", {
+            AnchorPoint = Vector2.new(1, 1),
+            BackgroundColor3 = "MainColor",
+            BorderSizePixel = 0,
+            Position = UDim2.new(1, 0, 1, 0),
+            Size = UDim2.fromOffset(DISCORD_STATUS_SIZE, DISCORD_STATUS_SIZE),
+            Visible = false,
+            ZIndex = 5,
+            Parent = Avatar,
+        })
+        New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = StatusRing })
+
+        local StatusDot = New("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = "BlueColor",
+            BorderSizePixel = 0,
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.new(1, -4, 1, -4),
+            ZIndex = 6,
+            Parent = StatusRing,
+        })
+        New("UICorner", { CornerRadius = UDim.new(1, 0), Parent = StatusDot })
+
+        local Body = New("Frame", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(0, Discord.BannerHeight),
+            Size = UDim2.new(1, 0, 1, -Discord.BannerHeight),
+            Parent = Card,
+        })
+        New("UIPadding", {
+            PaddingBottom = UDim.new(0, DISCORD_CARD_PADDING),
+            PaddingLeft = UDim.new(0, DISCORD_CARD_PADDING),
+            PaddingRight = UDim.new(0, DISCORD_CARD_PADDING),
+            Parent = Body,
+        })
+        New("UIListLayout", {
+            Padding = UDim.new(0, 2),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Parent = Body,
+        })
+
+        --// Reserves the room the avatar hangs into
+        local AvatarSpacer = New("Frame", {
+            BackgroundTransparency = 1,
+            LayoutOrder = 0,
+            Size = UDim2.new(1, 0, 0, 0),
+            Parent = Body,
+        })
+
+        local TitleLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            LayoutOrder = 1,
+            RichText = true,
+            Size = UDim2.new(1, 0, 0, DISCORD_TITLE_HEIGHT),
+            Text = Discord.Title,
+            TextSize = 16,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = Body,
+        })
+
+        local SubtitleLabel = New("TextLabel", {
+            BackgroundTransparency = 1,
+            LayoutOrder = 2,
+            RichText = true,
+            Size = UDim2.new(1, 0, 0, DISCORD_SUBTITLE_HEIGHT),
+            Text = Discord.Subtitle,
+            TextSize = 13,
+            TextTransparency = 0.4,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = Body,
+        })
+
+        local ButtonRow = New("Frame", {
+            BackgroundTransparency = 1,
+            LayoutOrder = 3,
+            Size = UDim2.new(1, 0, 0, DISCORD_BUTTON_HEIGHT + 6),
+            Visible = false,
+            Parent = Body,
+        })
+        New("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            HorizontalFlex = Enum.UIFlexAlignment.Fill,
+            Padding = UDim.new(0, DISCORD_BUTTON_GAP),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Parent = ButtonRow,
+        })
+        New("UIPadding", { PaddingTop = UDim.new(0, 6), Parent = ButtonRow })
+
+        --// Layout \\--
+        local function GetOverhang(): number
+            return math.floor(Discord.AvatarSize * DISCORD_AVATAR_OVERHANG) + DISCORD_AVATAR_RING
+        end
+
+        function Discord:GetTotalHeight(): number
+            local BodyHeight = GetOverhang() + 4 + DISCORD_TITLE_HEIGHT + DISCORD_CARD_PADDING
+
+            if SubtitleLabel.Visible then
+                BodyHeight += DISCORD_SUBTITLE_HEIGHT + 2
+            end
+
+            if ButtonRow.Visible then
+                BodyHeight += DISCORD_BUTTON_HEIGHT + 6 + 2
+            end
+
+            return Discord.BannerHeight + BodyHeight
+        end
+
+        local function UpdateLayout()
+            local RingSize = Discord.AvatarSize + DISCORD_AVATAR_RING * 2
+            local Overhang = GetOverhang()
+
+            Banner.Size = UDim2.new(1, 0, 0, Discord.BannerHeight)
+
+            Avatar.Size = UDim2.fromOffset(Discord.AvatarSize, Discord.AvatarSize)
+            AvatarRing.Size = UDim2.fromOffset(RingSize, RingSize)
+            AvatarRing.Position = UDim2.fromOffset(
+                DISCORD_CARD_PADDING - DISCORD_AVATAR_RING,
+                Discord.BannerHeight - (RingSize - Overhang)
+            )
+
+            Body.Position = UDim2.fromOffset(0, Discord.BannerHeight)
+            Body.Size = UDim2.new(1, 0, 1, -Discord.BannerHeight)
+            AvatarSpacer.Size = UDim2.new(1, 0, 0, Overhang + 4)
+
+            Holder.Size = UDim2.new(1, 0, 0, Discord:GetTotalHeight())
+            Groupbox:Resize()
+        end
+
+        --// Content \\--
+        local function ApplyImage(Object: ImageLabel, Source: string?, FallbackColor: (string | Color3)?)
+            local Icon = Source and Library:GetCustomIcon(Source) or nil
+
+            if Icon then
+                Library:ApplyLucideIcon(Object, Icon)
+                Object.Image = Icon.Url
+                Object.ImageTransparency = 0
+            else
+                Object.Image = ""
+                Object.ImageRectOffset = Vector2.zero
+                Object.ImageRectSize = Vector2.zero
+            end
+
+            SetSchemeProperty(Object, "BackgroundColor3", FallbackColor)
+        end
+
+        local function UpdateBanner()
+            ApplyImage(Banner, Discord.Banner, Discord.BannerColor or Discord.Accent)
+        end
+
+        local function UpdateAvatar()
+            --// A lucide glyph is a tinted shape, not a picture, so the plain
+            --// background reads better behind it than the accent would
+            ApplyImage(Avatar, Discord.Avatar, Discord.AvatarColor or "BackgroundColor")
+        end
+
+        local function UpdateStatus()
+            local Color = Discord.StatusColor
+
+            if not Color and typeof(Discord.Status) == "string" then
+                Color = DISCORD_STATUS_COLORS[string.lower(Discord.Status)]
+            end
+
+            StatusRing.Visible = Color ~= nil
+
+            if Color then
+                SetSchemeProperty(StatusDot, "BackgroundColor3", Color)
+            end
+        end
+
+        local function UpdateText()
+            TitleLabel.Text = Discord.Title or ""
+            TitleLabel.Visible = TitleLabel.Text ~= ""
+
+            SubtitleLabel.Text = Discord.Subtitle or ""
+            SubtitleLabel.Visible = SubtitleLabel.Text ~= ""
+
+            Discord.Text = Trim(string.format("%s %s", StripRichText(TitleLabel.Text), StripRichText(SubtitleLabel.Text)))
+            UpdateLayout()
+        end
+
+        --// Buttons \\--
+        local function CreateActionButton(Config, Order: number)
+            local IsPrimary = string.lower(tostring(Config.Style or "Primary")) == "primary"
+            local Label = tostring(Config.Text or "")
+
+            local Base = New("TextButton", {
+                BackgroundColor3 = IsPrimary and "BlueColor" or "BackgroundColor",
+                LayoutOrder = Order,
+                Size = UDim2.new(0, 0, 0, DISCORD_BUTTON_HEIGHT),
+                Text = "",
+                Parent = ButtonRow,
+            })
+
+            if IsPrimary then
+                SetSchemeProperty(Base, "BackgroundColor3", Discord.Accent)
+            end
+
+            table.insert(Library.PillCorners, New("UICorner", {
+                CornerRadius = Library.CornerRadius > 0 and UDim.new(1, 0) or UDim.new(0, 0),
+                Parent = Base,
+            }))
+
+            if not IsPrimary then
+                New("UIStroke", { Color = "OutlineColor", Parent = Base })
+            end
+
+            local Content = New("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                AutomaticSize = Enum.AutomaticSize.X,
+                BackgroundTransparency = 1,
+                Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(0, 16),
+                Parent = Base,
+            })
+            New("UIListLayout", {
+                FillDirection = Enum.FillDirection.Horizontal,
+                HorizontalAlignment = Enum.HorizontalAlignment.Center,
+                VerticalAlignment = Enum.VerticalAlignment.Center,
+                Padding = UDim.new(0, 6),
+                Parent = Content,
+            })
+
+            local IconLabel
+            local Icon = Library:GetCustomIcon(Config.Icon)
+            if Icon then
+                IconLabel = New("ImageLabel", {
+                    BackgroundTransparency = 1,
+                    ImageColor3 = "FontColor",
+                    Size = UDim2.fromOffset(15, 15),
+                    Parent = Content,
+                })
+                Library:ApplyLucideIcon(IconLabel, Icon)
+            end
+
+            local TextLabel = New("TextLabel", {
+                AutomaticSize = Enum.AutomaticSize.X,
+                BackgroundTransparency = 1,
+                Size = UDim2.fromOffset(0, 16),
+                Text = Label,
+                TextSize = 14,
+                TextTransparency = IsPrimary and 0 or 0.25,
+                Parent = Content,
+            })
+
+            local ButtonObject = {
+                Base = Base,
+                Label = TextLabel,
+                Icon = IconLabel,
+                Config = Config,
+                Text = Label,
+                Primary = IsPrimary,
+            }
+
+            local HoverTween
+            local function SetHovered(Hovered: boolean)
+                StopTween(HoverTween)
+
+                HoverTween = TweenService:Create(TextLabel, Library.TweenInfo, {
+                    TextTransparency = Hovered and 0 or (IsPrimary and 0 or 0.25),
+                })
+                HoverTween:Play()
+
+                --// The filled button already reads as active, so only the outlined
+                --// one lightens on hover
+                if not IsPrimary then
+                    Base.BackgroundTransparency = Hovered and 0.35 or 0
+                end
+            end
+
+            table.insert(Discord.Connections, Base.MouseEnter:Connect(function()
+                SetHovered(true)
+            end))
+            table.insert(Discord.Connections, Base.MouseLeave:Connect(function()
+                SetHovered(false)
+            end))
+
+            --// Flash a result on the button itself, then put the label back
+            local FlashThread
+            local function Flash(Text: string)
+                if FlashThread then
+                    task.cancel(FlashThread)
+                end
+
+                TextLabel.Text = Text
+                FlashThread = task.delay(DISCORD_COPY_FEEDBACK_TIME, function()
+                    FlashThread = nil
+
+                    if not Discord.Destroyed then
+                        TextLabel.Text = ButtonObject.Text
+                    end
+                end)
+            end
+
+            ButtonObject.Flash = Flash
+
+            table.insert(Discord.Connections, Base.MouseButton1Click:Connect(function()
+                --// Copy = true takes the card Link; Copy = "..." carries its own payload
+                local Payload = Config.Copy
+                if Payload == true then
+                    Payload = Discord.Link
+                end
+
+                if typeof(Payload) == "string" and Payload ~= "" then
+                    if SetClipboard then
+                        SetClipboard(Payload)
+                        Flash(tostring(Config.CopiedText or Info.CopiedText))
+                    else
+                        --// No clipboard on this executor: say so rather than lie
+                        Flash(tostring(Config.CopyFailedText or Info.CopyFailedText))
+                    end
+                end
+
+                Library:SafeCallback(Config.Func, Payload)
+            end))
+
+            if typeof(Config.Tooltip) == "string" then
+                Library:AddTooltip(Config.Tooltip, nil, Base)
+            end
+
+            return ButtonObject
+        end
+
+        local function RebuildButtons()
+            for Index = #ButtonObjects, 1, -1 do
+                table.remove(ButtonObjects, Index).Base:Destroy()
+            end
+
+            for Order, Config in Discord.Buttons do
+                if typeof(Config) == "table" then
+                    table.insert(ButtonObjects, CreateActionButton(Config, Order))
+                end
+            end
+
+            ButtonRow.Visible = #ButtonObjects > 0
+            UpdateLayout()
+        end
+
+        --// A card given a Link but no buttons still needs a way to use it
+        local function ResolveButtons(Buttons)
+            if typeof(Buttons) == "table" and #Buttons > 0 then
+                return Buttons
+            end
+
+            if typeof(Discord.Link) == "string" and Discord.Link ~= "" then
+                return { { Text = Info.CopyText, Icon = Info.CopyIcon, Copy = true } }
+            end
+
+            return {}
+        end
+
+        --// API \\--
+        function Discord:SetTitle(Title: string?)
+            Discord.Title = Title or ""
+            UpdateText()
+        end
+
+        function Discord:SetSubtitle(Subtitle: string?)
+            Discord.Subtitle = Subtitle or ""
+            UpdateText()
+        end
+
+        function Discord:SetBanner(Banner: string?, Color: (Color3 | string)?)
+            Discord.Banner = Banner
+            if Color ~= nil then
+                Discord.BannerColor = Color
+            end
+
+            UpdateBanner()
+        end
+
+        function Discord:SetAvatar(Avatar: string?, Color: (Color3 | string)?)
+            Discord.Avatar = Avatar
+            if Color ~= nil then
+                Discord.AvatarColor = Color
+            end
+
+            UpdateAvatar()
+        end
+
+        function Discord:SetStatus(Status: string?, Color: Color3?)
+            Discord.Status = Status
+            Discord.StatusColor = Color
+            UpdateStatus()
+        end
+
+        function Discord:SetAccent(Accent: (Color3 | string)?)
+            Discord.Accent = Accent
+
+            if not Discord.BannerColor then
+                UpdateBanner()
+            end
+
+            for _, ButtonObject in ButtonObjects do
+                if ButtonObject.Primary then
+                    SetSchemeProperty(ButtonObject.Base, "BackgroundColor3", Accent)
+                end
+            end
+        end
+
+        function Discord:SetLink(Link: string?)
+            Discord.Link = Link
+        end
+
+        function Discord:SetButtons(Buttons)
+            Discord.Buttons = ResolveButtons(Buttons)
+            RebuildButtons()
+        end
+
+        function Discord:SetButtonText(Index: number, Text: string)
+            local ButtonObject = ButtonObjects[Index]
+            if not ButtonObject then
+                return
+            end
+
+            ButtonObject.Text = Text
+            ButtonObject.Label.Text = Text
+        end
+
+        function Discord:SetBannerHeight(Height: number)
+            assert(Height > 0, "Height must be greater than 0.")
+
+            Discord.BannerHeight = Height
+            UpdateLayout()
+        end
+
+        function Discord:SetAvatarSize(Size: number)
+            assert(Size > 0, "Size must be greater than 0.")
+
+            Discord.AvatarSize = Size
+            UpdateLayout()
+        end
+
+        function Discord:SetVisible(Visible: boolean)
+            Discord.Visible = Visible
+
+            Holder.Visible = Visible
+            Groupbox:Resize()
+        end
+
+        function Discord:Destroy()
+            Discord.Destroyed = true
+
+            for _, Connection in Discord.Connections do
+                Connection:Disconnect()
+            end
+            table.clear(Discord.Connections)
+
+            if Holder then
+                Holder:Destroy()
+            end
+
+            local ElemIdx = table.find(Groupbox.Elements, Discord)
+            if ElemIdx then
+                table.remove(Groupbox.Elements, ElemIdx)
+            end
+
+            Groupbox:Resize()
+
+            if Idx ~= nil then
+                Options[Idx] = nil
+            end
+        end
+
+        UpdateBanner()
+        UpdateAvatar()
+        UpdateStatus()
+        UpdateText()
+
+        Discord.Buttons = ResolveButtons(Info.Buttons)
+        RebuildButtons()
+
+        Discord.Holder = Holder
+        table.insert(Groupbox.Elements, Discord)
+
+        --// Unlike most elements the card has no value to save, so an index is
+        --// optional; it is only registered when one is given
+        if Idx ~= nil then
+            Options[Idx] = Discord
+        end
+
+        return Discord
+    end
+
     function Funcs:AddVideo(Idx, Info)
         if self.Destroyed then return nil end
 
@@ -13972,12 +14640,13 @@ function Library:CreateWindow(WindowInfo)
     local CurrentTabLabel
     local CurrentTabDescription
     local ResizeButton
-    local GlowImage
+    local GlowParts = {}
     local GlowConfig = {
         Enabled = false,
-        Transparency = 0.4,
-        Radius = 18,
+        Transparency = 0.35,
+        Radius = 16,
         UseAccent = true,
+        Color = nil,
     }
     local Tabs
     local Container
@@ -15164,81 +15833,103 @@ function Library:CreateWindow(WindowInfo)
     --// Manual, opt-in soft glow drawn behind the window. It is never enabled or
     --// hidden automatically: some games run anticheats that can flag unusual
     --// rendering, so the user is the one who turns this on.
-    local function SetGlowColor(Color: Color3?)
-        if not GlowImage then
+    --//
+    --// One glow image is bound to each frame it can sit behind: the window and
+    --// the minimized pill. Geometry is mirrored from the frame's own absolute
+    --// position and size through change signals instead of being polled every
+    --// frame, so the glow is always exactly where the frame is rather than
+    --// drifting a frame behind it while the window is dragged or resized.
+    --//
+    --// The asset is a feathered shadow with a 49px border per edge, so an edge
+    --// slice paints 49 * SliceScale pixels. Padding the image by Radius and
+    --// scaling the slice to match puts the whole falloff inside that padding:
+    --// the halo hugs the frame evenly and fades out, instead of being clipped
+    --// into a hard tinted box.
+    local GLOW_SLICE = 49
+
+    local function GetGlowRadius(): number
+        return math.max(0, GlowConfig.Radius)
+    end
+
+    local function SyncGlow(Image: ImageLabel, Frame: GuiObject)
+        local Radius = GetGlowRadius()
+        local Size = Frame.AbsoluteSize
+
+        if not (GlowConfig.Enabled and Frame.Visible and Radius > 0 and Size.X > 0 and Size.Y > 0) then
+            Image.Visible = false
             return
         end
 
-        if typeof(Color) == "Color3" then
-            --// Detach from the theme so a custom color sticks across theme changes
-            GlowConfig.UseAccent = false
-            Library.Registry[GlowImage] = nil
-            GlowImage.ImageColor3 = Color
-        else
-            --// Follow the accent color and keep updating with the theme
-            GlowConfig.UseAccent = true
-            Library.Registry[GlowImage] = { ImageColor3 = "AccentColor" }
-            GlowImage.ImageColor3 = Library.Scheme.AccentColor
-        end
+        Image.Position = UDim2.fromOffset(Frame.AbsolutePosition.X - Radius, Frame.AbsolutePosition.Y - Radius)
+        Image.Size = UDim2.fromOffset(Size.X + Radius * 2, Size.Y + Radius * 2)
+        Image.SliceScale = Radius / GLOW_SLICE
+        Image.ImageTransparency = GlowConfig.Transparency
+        Image.Visible = true
     end
 
-    --// Keep the glow soft. This is a feathered 9-slice shadow asset, so its
-    --// SliceScale governs edge softness, not corner radius — shrinking it just
-    --// collapses the halo into a hard squared box. A soft glow naturally reads
-    --// fine behind any corner radius, so we hold it at the native slice scale.
+    --// Refresh every glow; used whenever the config or the window shape changes
     local function UpdateGlowShape()
-        if not GlowImage then
-            return
+        for Frame, Image in GlowParts do
+            SyncGlow(Image, Frame)
         end
-
-        GlowImage.SliceScale = 1
     end
 
-    local function EnsureGlow()
-        if GlowImage then
+    local function SetGlowColor(Color: Color3?)
+        GlowConfig.Color = typeof(Color) == "Color3" and Color or nil
+        GlowConfig.UseAccent = GlowConfig.Color == nil
+
+        for _, Image in GlowParts do
+            if GlowConfig.Color then
+                --// Detach from the theme so a custom color sticks across theme changes
+                Library.Registry[Image] = nil
+                Image.ImageColor3 = GlowConfig.Color
+            else
+                --// Follow the accent color and keep updating with the theme
+                Library.Registry[Image] = { ImageColor3 = "AccentColor" }
+                Image.ImageColor3 = Library.Scheme.AccentColor
+            end
+        end
+    end
+
+    local function BindGlow(Frame: GuiObject?)
+        if not Frame or GlowParts[Frame] then
             return
         end
 
-        GlowImage = New("ImageLabel", {
+        local Image = New("ImageLabel", {
             Active = false,
             BackgroundTransparency = 1,
-            --// 9-slice soft shadow asset; tinted to act as a glow
+            --// Feathered 9-slice shadow asset, tinted to act as a glow
             Image = "rbxassetid://6014261993",
             ImageColor3 = "AccentColor",
             ImageTransparency = GlowConfig.Transparency,
+            Name = "Glow",
             ScaleType = Enum.ScaleType.Slice,
-            SliceCenter = Rect.new(49, 49, 450, 450),
+            SliceCenter = Rect.new(GLOW_SLICE, GLOW_SLICE, 450, 450),
             Visible = false,
+            --// Behind the frame it belongs to (the ScreenGui uses sibling ZIndex)
             ZIndex = 0,
             Parent = ScreenGui,
         })
+
+        GlowParts[Frame] = Image
+
+        for _, Property in { "AbsolutePosition", "AbsoluteSize", "Visible" } do
+            Library:GiveSignal(Frame:GetPropertyChangedSignal(Property):Connect(function()
+                SyncGlow(Image, Frame)
+            end))
+        end
+
+        SyncGlow(Image, Frame)
+    end
+
+    local function EnsureGlow()
+        --// The window and the minimized pill each keep their own glow, so the
+        --// halo is already in place when one swaps for the other.
+        BindGlow(MainFrame)
+        BindGlow(MiniFrame)
+        SetGlowColor(GlowConfig.Color)
         UpdateGlowShape()
-
-        Library:GiveSignal(RunService.RenderStepped:Connect(function()
-            if not (GlowImage and MainFrame) then
-                return
-            end
-
-            --// Glow follows whichever frame is on screen — the main window, or the
-            --// minimized pill when collapsed — so the accent glow stays with the UI.
-            local Target = if (MiniFrame and MiniFrame.Visible) then MiniFrame else MainFrame
-
-            local ShouldShow = GlowConfig.Enabled and Target.Visible
-            GlowImage.Visible = ShouldShow
-            if not ShouldShow then
-                return
-            end
-
-            local Radius = GlowConfig.Radius
-            GlowImage.Position = UDim2.fromOffset(
-                Target.AbsolutePosition.X - Radius,
-                Target.AbsolutePosition.Y - Radius
-            )
-            GlowImage.Size = UDim2.fromOffset(
-                Target.AbsoluteSize.X + Radius * 2,
-                Target.AbsoluteSize.Y + Radius * 2
-            )
-        end))
     end
 
     --// Enabled: turn the glow on/off. Options: { Color: Color3?, Transparency: number?, Radius: number? }
@@ -15258,15 +15949,11 @@ function Library:CreateWindow(WindowInfo)
 
         if GlowConfig.Enabled then
             EnsureGlow()
-            GlowImage.ImageTransparency = GlowConfig.Transparency
-            UpdateGlowShape()
-
             if Options.Color ~= nil then
                 SetGlowColor(typeof(Options.Color) == "Color3" and Options.Color or nil)
             end
-        elseif GlowImage then
-            GlowImage.Visible = false
-            GlowImage.ImageTransparency = GlowConfig.Transparency
+        else
+            UpdateGlowShape()
         end
 
         return Window
@@ -16292,10 +16979,13 @@ function Library:CreateWindow(WindowInfo)
                 local Scale = Library.DPIScale > 0 and Library.DPIScale or 1
                 local RelX = (Button.AbsolutePosition.X - TabboxButtons.AbsolutePosition.X) / Scale
                 local Width = Button.AbsoluteSize.X / Scale
-                local Pad = 12
 
-                local GoalPos = UDim2.fromOffset(math.floor(RelX + Pad), 35)
-                local GoalSize = UDim2.fromOffset(math.max(0, math.floor(Width - Pad * 2)), 2)
+                --// Centered under the button, a fraction of its width
+                local BarWidth = math.max(TABBOX_UNDERLINE_MIN, math.floor(Width * TABBOX_UNDERLINE_WIDTH))
+                BarWidth = math.min(BarWidth, math.floor(Width))
+
+                local GoalPos = UDim2.fromOffset(math.floor(RelX + (Width - BarWidth) / 2), 35)
+                local GoalSize = UDim2.fromOffset(BarWidth, 2)
 
                 TabboxUnderline.Visible = true
                 if Animate and Library.Animations and Library.Animations.SubTabUnderline ~= false then
@@ -16554,6 +17244,35 @@ function Library:CreateWindow(WindowInfo)
                 Button.MouseButton1Click:Connect(Tab.Show)
 
                 setmetatable(Tab, BaseGroupbox)
+
+                --// Adding a tab re-flexes the row, so every button shrinks while
+                --// the row itself keeps its width. Without this the underline would
+                --// keep the first tab's full-row width until the user switched tabs.
+                table.insert(
+                    Tab.Connections,
+                    Button:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+                        if Tabbox.ActiveTab == Tab then
+                            MoveUnderline(Tab.ButtonHolder, false)
+                        end
+                    end)
+                )
+                table.insert(
+                    Tab.Connections,
+                    Button:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
+                        if Tabbox.ActiveTab == Tab then
+                            MoveUnderline(Tab.ButtonHolder, false)
+                        end
+                    end)
+                )
+
+                if Tabbox.ActiveTab then
+                    local ActiveButton = Tabbox.ActiveTab.ButtonHolder
+                    task.defer(function()
+                        if not Tabbox.Destroyed then
+                            MoveUnderline(ActiveButton, false)
+                        end
+                    end)
+                end
 
                 Tabbox.Tabs[TabStoringIndex] = Tab
                 Tabbox:UpdateCorners()
@@ -16828,8 +17547,11 @@ function Library:CreateWindow(WindowInfo)
 
             local ResizeTween
             local CollapseArrowTween
+            local CollapseClipThread
 
-            function Groupbox:Resize()
+            --// ForceAnimate lets the collapse slide play even when the general
+            --// groupbox resize animation is off
+            function Groupbox:Resize(ForceAnimate: boolean?)
                 if ResizeTween then
                     StopTween(ResizeTween, true)
                     ResizeTween = nil
@@ -16845,7 +17567,7 @@ function Library:CreateWindow(WindowInfo)
                 GroupboxContainer.Size = UDim2.new(1, 0, 0, ContainerSize)
                 GroupboxLine.Visible = not Groupbox.Collapsed
 
-                if Library.Animations and Library.Animations.Groupbox then
+                if ForceAnimate == true or (Library.Animations and Library.Animations.Groupbox) then
                     local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
                     local Tween = TweenService:Create(GroupboxHolder, TweenInfo, { Size = TargetSize })
                     ResizeTween = Tween
@@ -16885,9 +17607,24 @@ function Library:CreateWindow(WindowInfo)
 
                 local TargetRotation = if Collapsed then 0 else 180
 
-                GroupboxContainer.Visible = not Collapsed
-                if Library.Animations and Library.Animations.Groupbox then
-                    local TweenInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+                --// Slide the card open/shut instead of snapping. The body stays
+                --// parented and visible for the whole slide, with the holder
+                --// clipping it, so the contents wipe away behind the edge.
+                local AnimateCollapse = (Library.Animations == nil) or (Library.Animations.GroupboxCollapse ~= false)
+                if CollapseClipThread then
+                    task.cancel(CollapseClipThread)
+                    CollapseClipThread = nil
+                end
+
+                if AnimateCollapse then
+                    GroupboxHolder.ClipsDescendants = true
+                    GroupboxContainer.Visible = true
+                else
+                    GroupboxContainer.Visible = not Collapsed
+                end
+
+                if AnimateCollapse then
+                    local TweenInfo = Library.RotatingChevronTweenInfo or TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
                     local Tween = TweenService:Create(GroupboxCollapseArrow, TweenInfo, { Rotation = TargetRotation })
                     CollapseArrowTween = Tween
 
@@ -16907,7 +17644,23 @@ function Library:CreateWindow(WindowInfo)
                     GroupboxCollapseArrow.Rotation = TargetRotation
                 end
 
-                Groupbox:Resize()
+                Groupbox:Resize(AnimateCollapse)
+
+                if AnimateCollapse then
+                    --// Restore clipping/visibility once the slide has landed, so
+                    --// pop-outs and overflowing menus behave normally again
+                    local SlideInfo = Library.GroupboxTweenInfo or TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+                    CollapseClipThread = task.delay(SlideInfo.Time, function()
+                        CollapseClipThread = nil
+
+                        if Groupbox.Destroyed then
+                            return
+                        end
+
+                        GroupboxHolder.ClipsDescendants = false
+                        GroupboxContainer.Visible = not Groupbox.Collapsed
+                    end)
+                end
             end
 
             function Groupbox:ToggleCollapsed()
@@ -16953,6 +17706,11 @@ function Library:CreateWindow(WindowInfo)
                 if CollapseArrowTween then
                     StopTween(CollapseArrowTween, true)
                     CollapseArrowTween = nil
+                end
+
+                if CollapseClipThread then
+                    task.cancel(CollapseClipThread)
+                    CollapseClipThread = nil
                 end
 
                 if Groupbox.Connections then
