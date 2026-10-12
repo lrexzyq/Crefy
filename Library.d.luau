@@ -555,6 +555,44 @@ export type StatusLabel = {
     Destroy: (self: StatusLabel) -> (),
 }
 
+export type StatItem = {
+    Value: any,
+    Text: string?,
+    ValueColor: (Color3 | string)?,
+    Tooltip: string?,
+}
+
+export type StatGridInfo = {
+    Items: { StatItem }?,
+    Columns: number?,
+    TileHeight: number?,
+    Padding: number?,
+    Tooltip: string?,
+    Visible: boolean?,
+    Idx: string?,
+}
+
+export type StatGrid = {
+    Items: { StatItem },
+    Columns: number,
+    TileHeight: number,
+    Padding: number,
+    Visible: boolean,
+    Type: "StatGrid",
+    Holder: Frame,
+    Container: GuiObject,
+    Parent: BaseGroupbox,
+
+    SetItems: (self: StatGrid, Items: { StatItem }) -> (),
+    AddItem: (self: StatGrid, Item: StatItem) -> (),
+    SetValue: (self: StatGrid, Key: number | string | StatItem, Value: any, ValueColor: (Color3 | string)?) -> (),
+    UpdateItem: (self: StatGrid, Item: StatItem) -> (),
+    Clear: (self: StatGrid) -> (),
+    SetColumns: (self: StatGrid, Columns: number) -> (),
+    SetVisible: (self: StatGrid, Visible: boolean) -> (),
+    Destroy: (self: StatGrid) -> (),
+}
+
 export type Button = {
     Text: string,
     Func: (FromKeyPicker: boolean?) -> (),
@@ -734,7 +772,10 @@ export type Dropdown = {
     RefreshPool: (self: Dropdown) -> (),
     BuildDropdownList: (self: Dropdown) -> (),
     RunChanged: (self: Dropdown) -> (),
-    SetValue: (self: Dropdown, Value: any) -> (),
+    --// Returns (applied, unavailable values, problem). Unavailable values are left out.
+    SetValue: (self: Dropdown, Value: any) -> (boolean, { any }, string?),
+    --// Reads any selection shape: value, { "A", "B" } or { A = true }. -> (selection, unavailable, problem)
+    NormalizeValue: (self: Dropdown, Value: any) -> ({ any }, { any }, string?),
     SetValues: (self: Dropdown, Values: { [any]: any }) -> (),
     AddValues: (self: Dropdown, Values: { [any]: any } | string) -> (),
     SetDisabledValues: (self: Dropdown, DisabledValues: { any }) -> (),
@@ -893,6 +934,7 @@ export type Divider = {
 export type Element =
     Label
     | StatusLabel
+    | StatGrid
     | Button
     | Toggle
     | Input
@@ -931,6 +973,7 @@ export type BaseGroupbox = {
         Idx: string?
     ) -> Label,
     AddStatusLabel: (self: Groupbox, Idx: string | StatusLabelInfo, Info: StatusLabelInfo?) -> StatusLabel,
+    AddStatGrid: (self: Groupbox, Idx: string | StatGridInfo, Info: StatGridInfo?) -> StatGrid,
     AddButton: (self: Groupbox, Info: ButtonInfo | string, Func: (() -> ())?, Idx: string?) -> Button,
     AddCheckbox: (self: Groupbox, Idx: string, Info: ToggleInfo) -> Toggle,
     AddToggle: (self: Groupbox, Idx: string, Info: ToggleInfo) -> Toggle,
@@ -1400,6 +1443,8 @@ export type Library = {
     ForceCheckbox: boolean,
     ShowToggleFrameInKeybinds: boolean,
     NotifyOnError: boolean,
+    --// Called with the error of any element callback that fails (SaveManager sets it during a load)
+    OnCallbackError: ((Error: any) -> ())?,
     CantDragForced: boolean,
     DraggableElements: { GuiObject },
     PopOutSnapDistance: number,
@@ -1552,6 +1597,9 @@ export type Library = {
             IconColor: Color3 | string?,
             BigIcon: string?,
             Type: NotificationType?,
+            Closable: boolean?,
+            Callback: ((Reason: string) -> ())?,
+            Buttons: { { Text: string, Func: ((Notification: Notification) -> ())?, Close: boolean? } }?,
         } | string,
         Time: number?,
         SoundId: string | number?

@@ -889,6 +889,78 @@ local function IsSequentialArray(Table: { [any]: any })
     return true
 end
 
+--// Reads a dropdown selection in any of its shapes -- a single value, an array
+--// { "A", "B" } or a set { A = true, B = false } -- the same way everywhere.
+--// Returns the values that exist in Values (in list order), the requested ones
+--// that do not, and a problem string when the input is not a selection at all
+--// (a nested table, a set whose entries aren't booleans, or several values for a
+--// single select). Unavailable values are reported, never swapped for others.
+local function NormalizeDropdownSelection(Values: { [any]: any }, Multi: boolean?, Input: any): ({ any }, { any }, string?)
+    Values = if typeof(Values) == "table" then Values else {}
+
+    local ValuesIsArray = IsSequentialArray(Values)
+    local function Exists(Value: any): boolean
+        if Value == nil then
+            return false
+        end
+
+        return if ValuesIsArray then table.find(Values, Value) ~= nil else Values[Value] ~= nil
+    end
+
+    local Candidates = {}
+    if typeof(Input) == "table" then
+        if IsSequentialArray(Input) then
+            for _, Value in Input do
+                if typeof(Value) == "table" then
+                    return {}, {}, "the selection holds a nested table"
+                end
+
+                table.insert(Candidates, Value)
+            end
+        else
+            for Value, Selected in Input do
+                if typeof(Selected) ~= "boolean" then
+                    return {}, {}, "a set selection must map each value to true or false"
+                end
+
+                if Selected then
+                    table.insert(Candidates, Value)
+                end
+            end
+        end
+    elseif Input ~= nil and not (Input == "" and not Exists("")) then
+        Candidates = { Input }
+    end
+
+    local Selection, Unavailable, Seen = {}, {}, {}
+    for _, Value in Candidates do
+        if Seen[Value] then continue end
+        Seen[Value] = true
+
+        table.insert(if Exists(Value) then Selection else Unavailable, Value)
+    end
+
+    if not Multi and #Selection + #Unavailable > 1 then
+        return {}, {}, string.format("a single select got %d values", #Selection + #Unavailable)
+    end
+
+    if ValuesIsArray then
+        table.sort(Selection, function(A, B)
+            return table.find(Values, A) < table.find(Values, B)
+        end)
+    else
+        table.sort(Selection, function(A, B)
+            return tostring(A) < tostring(B)
+        end)
+    end
+
+    table.sort(Unavailable, function(A, B)
+        return tostring(A) < tostring(B)
+    end)
+
+    return Selection, Unavailable, nil
+end
+
 local function StopTween(Tween: TweenBase, Destroy: boolean?)
     if not Tween then
         return
@@ -2200,6 +2272,13 @@ function Library:SafeCallback(Func: (...any) -> ...any, ...: any)
 
     local Result = table.pack(xpcall(Func, function(Error)
         task.defer(error, debug.traceback(Error, 2))
+
+        --// Lets an addon (SaveManager's config load) count callback errors it caused
+        local OnCallbackError = Library.OnCallbackError
+        if typeof(OnCallbackError) == "function" then
+            pcall(OnCallbackError, Error)
+        end
+
         if Library.NotifyOnError and Library.Notify then
             Library:Notify(Error)
         end
@@ -3114,14 +3193,15 @@ local SUBTAB_SLIDE_TWEEN = TweenInfo.new(0.25, Enum.EasingStyle.Quint, Enum.Easi
 --// Fraction of the chip the underline spans, and its gap above the chip's bottom edge
 local SUBTAB_UNDERLINE_WIDTH = 0.66
 local SUBTAB_UNDERLINE_GAP = 3
---// The tab row is a segmented control: a recessed rail inset inside the 34px
---// row, with a raised accent chip sliding between the segments
+--// The tab row sits flush in the 34px header; the open tab is a soft pill in
+--// the element colour that slides between tabs, with a short accent marker
+--// under its label
 local TABBOX_RAIL_INSET = 4
 local TABBOX_RAIL_HEIGHT = 26
-local TABBOX_CHIP_INSET = 2
---// The chip gradient multiplies over the accent, giving it a lit top edge
-local TABBOX_CHIP_GRADIENT_FROM = Color3.fromRGB(255, 255, 255)
-local TABBOX_CHIP_GRADIENT_TO = Color3.fromRGB(206, 206, 206)
+local TABBOX_CHIP_INSET = 0
+--// Fraction of the pill the accent marker spans, and its thickness
+local TABBOX_MARKER_WIDTH = 0.4
+local TABBOX_MARKER_HEIGHT = 2
 --// Idle, hovered and open text/icon fade for a tab in the row
 local TABBOX_TAB_IDLE_FADE = 0.55
 local TABBOX_TAB_HOVER_FADE = 0.25
@@ -8221,19 +8301,21 @@ do
                 Parent = Status,
             })
 
-            table.insert(
-                Library.PillCorners,
-                New("UICorner", {
-                    CornerRadius = Library.CornerRadius > 0 and UDim.new(1, 0) or UDim.new(0, 0),
-                    Parent = Status,
-                })
-            )
+            --// The row keeps its own corner so ClearRows can take it back out of
+            --// PillCorners; a list rebuilt on every reorder would otherwise pin
+            --// every destroyed corner there for the life of the library
+            local Corner = New("UICorner", {
+                CornerRadius = Library.CornerRadius > 0 and UDim.new(1, 0) or UDim.new(0, 0),
+                Parent = Status,
+            })
+            table.insert(Library.PillCorners, Corner)
 
             local Row = {
                 Item = Item,
                 Holder = RowHolder,
                 TextLabel = TextLabel,
                 Status = Status,
+                Corner = Corner,
                 Hovering = false,
             }
 
@@ -8279,10 +8361,31 @@ do
             end
             table.clear(StatusLabel.RowConnections)
 
+            if #StatusLabel.Rows == 0 then
+                return
+            end
+
+            local Owned = {}
             for _, Row in StatusLabel.Rows do
+                Owned[Row.Corner] = true
                 Row.Holder:Destroy()
             end
             table.clear(StatusLabel.Rows)
+
+            --// One compacting pass rather than a find-and-remove per row, so a
+            --// rebuild stays linear in the size of PillCorners
+            local PillCorners = Library.PillCorners
+            local Write = 0
+            for Read = 1, #PillCorners do
+                local UICorner = PillCorners[Read]
+                if not Owned[UICorner] then
+                    Write += 1
+                    PillCorners[Write] = UICorner
+                end
+            end
+            for Index = #PillCorners, Write + 1, -1 do
+                PillCorners[Index] = nil
+            end
         end
 
         function StatusLabel:Display()
@@ -8416,6 +8519,273 @@ do
         end
 
         return StatusLabel
+    end
+
+    --// A grid of small tiles, each a big value over a quiet caption: the shape of
+    --// a status readout ("7m 10s" over "session", "61" over "fps") where the number
+    --// is the thing being read and the caption only says what it is. Values change
+    --// far more often than the layout, so SetValue rewrites one tile in place.
+    function Funcs:AddStatGrid(Idx, Info)
+        if self.Destroyed then return nil end
+
+        if typeof(Idx) == "table" then
+            Info = Idx
+            Idx = Info.Idx
+        end
+
+        Info = Library:Validate(Info or {}, {
+            Items = {},                 --// { { Value, Text, ValueColor, Tooltip } }
+            Columns = 3,
+            TileHeight = 44,
+            Padding = 6,
+            Tooltip = nil,
+            Visible = true,
+        })
+
+        local Groupbox = self
+        local Container = Groupbox.Container
+
+        local StatGrid = {
+            Connections = {},
+            Tiles = {},
+            Destroyed = false,
+
+            Items = Info.Items,
+            Columns = math.max(math.floor(Info.Columns), 1),
+            TileHeight = Info.TileHeight,
+            Padding = Info.Padding,
+            Tooltip = Info.Tooltip,
+            Visible = Info.Visible,
+
+            Type = "StatGrid",
+            Parent = Groupbox,
+        }
+
+        local Holder = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, Info.TileHeight),
+            Visible = StatGrid.Visible,
+            Parent = Container,
+        })
+
+        local Grid = New("UIGridLayout", {
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Parent = Holder,
+        })
+
+        --// The height comes from the tile count rather than being read back from
+        --// the layout, so the groupbox is the right size on the first frame
+        local function Resize()
+            local Columns = StatGrid.Columns
+            local Rows = math.max(math.ceil(#StatGrid.Tiles / Columns), 1)
+
+            Grid.CellSize = UDim2.new(1 / Columns, -StatGrid.Padding * (Columns - 1) / Columns, 0, StatGrid.TileHeight)
+            Grid.CellPadding = UDim2.fromOffset(StatGrid.Padding, StatGrid.Padding)
+            Holder.Size = UDim2.new(1, 0, 0, Rows * StatGrid.TileHeight + (Rows - 1) * StatGrid.Padding)
+
+            Groupbox:Resize()
+        end
+
+        local function RenderTile(Tile)
+            local Item = Tile.Item
+            local Color = Item.ValueColor
+
+            Tile.Value.Text = tostring(Item.Value or "")
+            Tile.Caption.Text = tostring(Item.Text or "")
+
+            if typeof(Color) == "Color3" then
+                SetSchemeProperty(Tile.Value, "TextColor3", Color)
+            else
+                SetSchemeProperty(
+                    Tile.Value,
+                    "TextColor3",
+                    typeof(Color) == "string" and Library.Scheme[Color] and Color or "FontColor"
+                )
+            end
+        end
+
+        local function CreateTile(Item, Order)
+            local Frame = New("Frame", {
+                BackgroundColor3 = "MainColor",
+                LayoutOrder = Order,
+                Parent = Holder,
+            })
+            table.insert(Library.Corners, New("UICorner", {
+                CornerRadius = UDim.new(0, Library.CornerRadius / 2),
+                Parent = Frame,
+            }))
+
+            New("UIPadding", {
+                PaddingLeft = UDim.new(0, 8),
+                PaddingRight = UDim.new(0, 8),
+                Parent = Frame,
+            })
+
+            local Value = New("TextLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0, 0, 0.5, -15),
+                Size = UDim2.new(1, 0, 0, 18),
+                Text = "",
+                TextSize = 16,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = Frame,
+            })
+
+            local Caption = New("TextLabel", {
+                BackgroundTransparency = 1,
+                Position = UDim2.new(0, 0, 0.5, 4),
+                Size = UDim2.new(1, 0, 0, 12),
+                Text = "",
+                TextSize = 12,
+                TextTransparency = 0.5,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = Frame,
+            })
+
+            local Tile = {
+                Item = Item,
+                Frame = Frame,
+                Value = Value,
+                Caption = Caption,
+            }
+
+            if typeof(Item.Tooltip) == "string" then
+                Library:AddTooltip(Item.Tooltip, nil, Frame)
+            end
+
+            RenderTile(Tile)
+            return Tile
+        end
+
+        local function ClearTiles()
+            for _, Tile in StatGrid.Tiles do
+                Tile.Frame:Destroy()
+            end
+            table.clear(StatGrid.Tiles)
+        end
+
+        --// A tile is found by its position, its item table or its caption,
+        --// whichever the caller finds easiest to hold on to
+        local function FindTile(Key)
+            if typeof(Key) == "number" then
+                return StatGrid.Tiles[Key]
+            end
+
+            for _, Tile in StatGrid.Tiles do
+                if Tile.Item == Key or Tile.Item.Text == Key then
+                    return Tile
+                end
+            end
+
+            return nil
+        end
+
+        function StatGrid:SetItems(Items)
+            StatGrid.Items = Items or {}
+
+            ClearTiles()
+            for Order, Item in StatGrid.Items do
+                table.insert(StatGrid.Tiles, CreateTile(Item, Order))
+            end
+
+            Resize()
+        end
+
+        function StatGrid:AddItem(Item)
+            table.insert(StatGrid.Items, Item)
+            table.insert(StatGrid.Tiles, CreateTile(Item, #StatGrid.Items))
+
+            Resize()
+        end
+
+        function StatGrid:SetValue(Key, Value, ValueColor)
+            local Tile = FindTile(Key)
+            if not Tile then
+                return
+            end
+
+            Tile.Item.Value = Value
+            if ValueColor ~= nil then
+                Tile.Item.ValueColor = ValueColor
+            end
+
+            RenderTile(Tile)
+        end
+
+        --// Same item table the caller handed over, edited in place and pushed
+        function StatGrid:UpdateItem(Item)
+            local Tile = FindTile(Item)
+            if Tile then
+                RenderTile(Tile)
+            end
+        end
+
+        function StatGrid:Clear()
+            StatGrid.Items = {}
+
+            ClearTiles()
+            Resize()
+        end
+
+        function StatGrid:SetColumns(Columns: number)
+            StatGrid.Columns = math.max(math.floor(Columns), 1)
+            Resize()
+        end
+
+        function StatGrid:SetVisible(Visible: boolean)
+            StatGrid.Visible = Visible
+            Holder.Visible = Visible
+
+            Groupbox:Resize()
+        end
+
+        if typeof(StatGrid.Tooltip) == "string" then
+            StatGrid.TooltipTable = Library:AddTooltip(StatGrid.Tooltip, nil, Holder)
+        end
+
+        StatGrid:SetItems(StatGrid.Items)
+
+        StatGrid.Holder = Holder
+        StatGrid.Container = Container
+
+        table.insert(Groupbox.Elements, StatGrid)
+
+        if Idx then
+            Labels[Idx] = StatGrid
+        else
+            table.insert(Labels, StatGrid)
+        end
+
+        function StatGrid:Destroy()
+            StatGrid.Destroyed = true
+
+            for _, Connection in StatGrid.Connections do
+                Connection:Disconnect()
+            end
+            ClearTiles()
+
+            Holder:Destroy()
+
+            local ElemIdx = table.find(Groupbox.Elements, StatGrid)
+            if ElemIdx then
+                table.remove(Groupbox.Elements, ElemIdx)
+            end
+
+            Groupbox:Resize()
+
+            if Idx then
+                Labels[Idx] = nil
+            else
+                local LblIdx = table.find(Labels, StatGrid)
+                if LblIdx then
+                    table.remove(Labels, LblIdx)
+                end
+            end
+        end
+
+        return StatGrid
     end
 
 
@@ -11187,29 +11557,30 @@ do
             return Dropdown.Values[Val] ~= nil
         end
 
+        --// See NormalizeDropdownSelection for the accepted shapes
+        function Dropdown:NormalizeValue(Value)
+            return NormalizeDropdownSelection(Dropdown.Values, Info.Multi, Value)
+        end
+
+        --// Selects exactly the requested values that exist. Unavailable ones are left
+        --// out (a single select ends up empty) and returned so the caller can decide
+        --// what to do; input that isn't a selection changes nothing.
+        --// Returns (applied, unavailable, problem).
         function Dropdown:SetValue(Value)
+            local Selection, Unavailable, Problem = Dropdown:NormalizeValue(Value)
+            if Problem then
+                return false, Unavailable, Problem
+            end
+
             if Info.Multi then
-                if typeof(Value) == "string" then
-                    Value = if Value == "" then {} else { [Value] = true }
-                end
-
                 local Table = {}
-
-                for Val, Active in Value or {} do
-                    if typeof(Active) ~= "boolean" then
-                        Table[Active] = true
-                    elseif Active and ValueExists(Val) then
-                        Table[Val] = true
-                    end
+                for _, Val in Selection do
+                    Table[Val] = true
                 end
 
                 Dropdown.Value = Table
             else
-                if ValueExists(Value) then
-                    Dropdown.Value = Value
-                elseif not Value then
-                    Dropdown.Value = nil
-                end
+                Dropdown.Value = Selection[1]
             end
 
             Dropdown:Display()
@@ -11222,6 +11593,7 @@ do
             end
 
             Dropdown:RunChanged()
+            return true, Unavailable
         end
 
         function Dropdown:SetValues(Values)
@@ -14945,6 +15317,7 @@ function Library:Notify(...)
 
         Data.Callback = typeof(Info.Callback) == "function" and Info.Callback or nil
         Data.Closable = Info.Closable == true
+        Data.Buttons = typeof(Info.Buttons) == "table" and Info.Buttons or nil
 
         Data.Icon = Info.Icon
         Data.BigIcon = Info.BigIcon
@@ -15162,10 +15535,82 @@ function Library:Notify(...)
         })
     end
 
+    --// Action buttons: { { Text, Func, Close } }; Close defaults to true
+    local ButtonRow
+    local ButtonLabels = {}
+    if Data.Buttons and #Data.Buttons > 0 then
+        ButtonRow = New("Frame", {
+            BackgroundTransparency = 1,
+            Size = UDim2.new(1, 0, 0, 22),
+            Parent = ContentHolder,
+        })
+        New("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            Padding = UDim.new(0, 6),
+            Parent = ButtonRow,
+        })
+
+        for _, Info in Data.Buttons do
+            if typeof(Info) ~= "table" then
+                continue
+            end
+
+            local Button = New("TextButton", {
+                BackgroundColor3 = "MainColor",
+                Size = UDim2.fromOffset(0, 22),
+                Text = tostring(Info.Text or "Button"),
+                TextSize = 14,
+                TextTransparency = 0.4,
+                ZIndex = 6,
+                Parent = ButtonRow,
+            })
+            New("UIStroke", {
+                Color = "OutlineColor",
+                Parent = Button,
+            })
+            table.insert(
+                Library.PillCorners,
+                New("UICorner", {
+                    CornerRadius = Library.CornerRadius > 0 and UDim.new(1, 0) or UDim.new(0, 0),
+                    Parent = Button,
+                })
+            )
+            table.insert(ButtonLabels, Button)
+
+            Button.MouseEnter:Connect(function()
+                TweenService:Create(Button, Library.TweenInfo, {
+                    TextTransparency = 0,
+                }):Play()
+            end)
+            Button.MouseLeave:Connect(function()
+                TweenService:Create(Button, Library.TweenInfo, {
+                    TextTransparency = 0.4,
+                }):Play()
+            end)
+            Button.MouseButton1Click:Connect(function()
+                if Data.Destroyed then
+                    return
+                end
+                if typeof(Info.Func) == "function" then
+                    Library:SafeCallback(Info.Func, Data)
+                end
+                if Info.Close ~= false then
+                    Data:Destroy("button")
+                end
+            end)
+        end
+    end
+
     function Data:Resize()
         local ExtraWidth = BigIconLabel and 32 or 0
         local IconWidth = IconLabel and 21 or 0
         local CloseWidth = Data.Closable and 20 or 0
+        local ButtonsX = 0
+        for Index, Button in ButtonLabels do
+            local X = Library:GetTextBounds(Button.Text, Button.FontFace, Button.TextSize)
+            Button.Size = UDim2.fromOffset(X + 20, 22)
+            ButtonsX += X + 20 + (Index > 1 and 6 or 0)
+        end
         local MaxTextWidth = math.max(
             40,
             (NotificationArea.AbsoluteSize.X / Library.DPIScale) - 24 - ExtraWidth - CloseWidth
@@ -15184,7 +15629,7 @@ function Library:Notify(...)
             DescX = X
         end
 
-        FakeBackground.Size = UDim2.fromOffset(math.max(TitleX, DescX) + 24 + ExtraWidth + CloseWidth, 0)
+        FakeBackground.Size = UDim2.fromOffset(math.max(TitleX, DescX, ButtonsX - ExtraWidth) + 24 + ExtraWidth + CloseWidth, 0)
 
         if Library.Notifications[FakeBackground] then
             task.defer(function()
@@ -18319,36 +18764,22 @@ function Library:CreateWindow(WindowInfo)
                     Library:AddOutline(TabboxHolder)
                 end
 
-                --// The rail the segments sit in, sunk below the card surface
+                --// An invisible track the pill is positioned against; the header
+                --// itself stays flat so the row reads as part of the card
                 TabboxRail = New("Frame", {
                     AnchorPoint = Vector2.new(0, 0.5),
-                    --// Recessed against a groupbox surface, faintly raised when the
-                    --// tabbox is its own card and already sits on the darker colour
-                    BackgroundColor3 = function()
-                        return Library:GetBetterColor(Library.Scheme.BackgroundColor, InGroupbox and 0 or 6)
-                    end,
+                    BackgroundTransparency = 1,
                     Position = UDim2.new(0, TABBOX_RAIL_INSET, 0, 17),
                     Size = UDim2.new(1, -TABBOX_RAIL_INSET * 2, 0, TABBOX_RAIL_HEIGHT),
                     ZIndex = 1,
                     Parent = TabboxHolder,
                 })
-                table.insert(
-                    Library.Corners,
-                    New("UICorner", {
-                        CornerRadius = UDim.new(0, WindowInfo.CornerRadius),
-                        Parent = TabboxRail,
-                    })
-                )
-                New("UIStroke", {
-                    Color = "OutlineColor",
-                    Transparency = 0.4,
-                    Parent = TabboxRail,
-                })
 
-                --// The raised chip that slides between segments, carrying the accent
+                --// The soft pill that slides onto the open tab, in the same colour
+                --// and outline as the other elements
                 TabboxChip = New("Frame", {
                     AnchorPoint = Vector2.new(0, 0.5),
-                    BackgroundColor3 = "AccentColor",
+                    BackgroundColor3 = "MainColor",
                     Position = UDim2.new(0, TABBOX_CHIP_INSET, 0.5, 0),
                     Size = UDim2.new(0, 0, 0, TABBOX_RAIL_HEIGHT - TABBOX_CHIP_INSET * 2),
                     Visible = false,
@@ -18361,11 +18792,23 @@ function Library:CreateWindow(WindowInfo)
                         Parent = TabboxChip,
                     })
                 )
-                --// A lit top edge, so the chip reads as raised out of the rail
-                New("UIGradient", {
-                    Color = ColorSequence.new(TABBOX_CHIP_GRADIENT_FROM, TABBOX_CHIP_GRADIENT_TO),
-                    Rotation = 90,
+                New("UIStroke", {
+                    Color = "OutlineColor",
                     Parent = TabboxChip,
+                })
+
+                --// Short accent marker along the pill's bottom edge; it scales with
+                --// the pill, so it follows the slide for free
+                local TabboxMarker = New("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 1),
+                    BackgroundColor3 = "AccentColor",
+                    Position = UDim2.fromScale(0.5, 1),
+                    Size = UDim2.new(TABBOX_MARKER_WIDTH, 0, 0, TABBOX_MARKER_HEIGHT),
+                    Parent = TabboxChip,
+                })
+                New("UICorner", {
+                    CornerRadius = UDim.new(1, 0),
+                    Parent = TabboxMarker,
                 })
 
                 TabboxButtons = New("Frame", {
@@ -18576,19 +19019,14 @@ function Library:CreateWindow(WindowInfo)
                     DependencyBoxes = {},
                 }
 
-                --// An open tab sits on the accent chip, so its label and glyph flip
-                --// to whichever of black or white the accent can carry; everything
-                --// else fades against the rail instead
+                --// An open tab sits on the pill at full strength; everything else
+                --// fades back and fills in under the pointer
                 local Hovered = false
                 local function SetState(Active: boolean, Animate: boolean)
                     local Fade = Active and 0
                         or (Hovered and TABBOX_TAB_HOVER_FADE or TABBOX_TAB_IDLE_FADE)
 
                     if ButtonLabel then
-                        local Color = Active and OnAccentColor() or Library.Scheme.FontColor
-                        ButtonLabel.TextColor3 = Color
-                        Library.Registry[ButtonLabel].TextColor3 = Active and OnAccentColor or "FontColor"
-
                         if Animate then
                             TweenService:Create(ButtonLabel, TABBOX_TAB_FADE_TWEEN, {
                                 TextTransparency = Fade,
@@ -18599,12 +19037,6 @@ function Library:CreateWindow(WindowInfo)
                     end
 
                     if ButtonIcon then
-                        local IconColor = Active and OnAccentColor()
-                            or (BoxIcon.Custom and Library.Scheme.WhiteColor or Library.Scheme.AccentColor)
-                        ButtonIcon.ImageColor3 = IconColor
-                        Library.Registry[ButtonIcon].ImageColor3 = Active and OnAccentColor
-                            or (BoxIcon.Custom and "WhiteColor" or "AccentColor")
-
                         if Animate then
                             TweenService:Create(ButtonIcon, TABBOX_TAB_FADE_TWEEN, {
                                 ImageTransparency = Fade,
@@ -22780,6 +23212,7 @@ function Library:Unload()
 
     table.clear(Library.Corners)
     table.clear(Library.SpecificCorners)
+    table.clear(Library.PillCorners)
     table.clear(Library.ContextMenus)
 
     table.clear(Library.Notifications)
